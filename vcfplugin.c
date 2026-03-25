@@ -710,6 +710,7 @@ int main_plugin(int argc, char *argv[])
                     if ( *tmp || args->verbose<0 ) error("Could not parse argument: --verbosity %s\n", optarg);
                     if ( args->verbose > 3 ) hts_verbose = args->verbose;
                 }
+                break;
             case 'o': args->output_fname = optarg; break;
             case 'O':
                 switch (optarg[0]) {
