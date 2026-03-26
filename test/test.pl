@@ -64,9 +64,9 @@ run_test(\&test_vcf_isec,$opts,in=>['isec-miss.2.1','isec-miss.2.2','isec-miss.2
 #run_test(\&test_vcf_merge,$opts,in=>['merge.broken-phase.a','merge.broken-phase.b'],out=>'merge.broken-phase.1.out',args=>'');
 run_test(\&test_vcf_merge,$opts,in=>['merge.broken-gvcf.a','merge.broken-gvcf.b'],out=>'merge.broken-gvcf.1.out',args=>'');
 run_test(\&test_vcf_merge,$opts,in=>['merge.symbolic.1.a','merge.symbolic.1.b'],out=>'merge.symbolic.1.1.out',args=>'');
-run_test(\&test_vcf_merge,$opts,in=>['merge.multiallelics.1.a','merge.multiallelics.1.b'],out=>'merge.multiallelics.1.1.out',args=>'--merge none');
+run_test(\&test_vcf_merge,$opts,in=>['merge.multiallelics.1.a','merge.multiallelics.1.b'],out=>'merge.multiallelics.1.none.out',args=>'--merge none');
 run_test(\&test_vcf_merge,$opts,in=>['merge.multiallelics.1.a','merge.multiallelics.1.b'],out=>'merge.multiallelics.1.1.out',args=>'--merge both');
-run_test(\&test_vcf_merge,$opts,in=>['merge.12.a','merge.12.b'],out=>'merge.12.1.out',args=>'--merge none');
+run_test(\&test_vcf_merge,$opts,in=>['merge.12.a','merge.12.b'],out=>'merge.12.none.out',args=>'--merge none');
 run_test(\&test_vcf_merge,$opts,in=>['merge.12.a','merge.12.b'],out=>'merge.12.1.out',args=>'--merge both');
 run_test(\&test_vcf_merge,$opts,in=>['merge.phased.1.a','merge.phased.1.b'],out=>'merge.phased.1.1.out',args=>'');
 run_test(\&test_vcf_merge,$opts,in=>['merge.11.a','merge.11.b'],out=>'merge.11.1.out',args=>'');
