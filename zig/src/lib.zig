@@ -14,6 +14,7 @@ pub const csq_format = @import("csq/format.zig");
 pub const csq_pipeline = @import("csq/csq.zig");
 pub const vcf_record = @import("vcf/record.zig");
 pub const vcf_reader = @import("vcf/reader.zig");
+pub const vcf_htslib = @import("vcf/htslib.zig");
 
 // Version
 pub const version = "0.1.0";

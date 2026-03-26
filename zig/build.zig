@@ -10,6 +10,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // Link htslib for @cImport in vcf/htslib.zig
+    lib_mod.addIncludePath(.{ .cwd_relative = "../../htslib" });
+    lib_mod.addLibraryPath(.{ .cwd_relative = "../../htslib" });
+    lib_mod.linkSystemLibrary("hts", .{});
+    lib_mod.linkSystemLibrary("z", .{});
+    lib_mod.linkSystemLibrary("lzma", .{});
+    lib_mod.linkSystemLibrary("bz2", .{});
+    lib_mod.linkSystemLibrary("curl", .{});
+    lib_mod.linkSystemLibrary("deflate", .{});
+    lib_mod.linkSystemLibrary("pthread", .{});
+    lib_mod.linkSystemLibrary("m", .{});
 
     // Executable
     const exe = b.addExecutable(.{

@@ -137,7 +137,7 @@ pub const HtsFaidx = struct {
 
     /// Fetch a sequence region. Caller owns the returned slice.
     pub fn fetchSeq(self: *const HtsFaidx, alloc: std.mem.Allocator, seq: [*:0]const u8, beg: i64, end: i64) ![]u8 {
-        var len: c_int = 0;
+        var len: i64 = 0;
         const raw = c.faidx_fetch_seq64(self.fai, seq, beg, end, &len);
         if (raw == null) return error.FaidxFetchFailed;
         defer std.c.free(raw);

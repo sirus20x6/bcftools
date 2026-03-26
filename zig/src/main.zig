@@ -2,11 +2,18 @@ const std = @import("std");
 const lib = @import("bcftools_zig");
 const csq_mod = lib.csq_pipeline;
 const gff_mod = lib.gff;
+const htslib = lib.vcf_htslib;
 const VcfReader = lib.vcf_reader.VcfReader;
 const VcfRecord = lib.vcf_record.VcfRecord;
 const CsqContext = csq_mod.CsqContext;
 const GffParser = gff_mod.GffParser;
 const Phase = csq_mod.Phase;
+
+/// Adapter function: bridges CsqContext.FetchSeqFn to HtsFaidx.fetchSeq
+fn htsFaidxFetchAdapter(ctx: *anyopaque, allocator: std.mem.Allocator, chr: [*:0]const u8, beg: i64, end: i64) ?[]u8 {
+    const fai: *htslib.HtsFaidx = @ptrCast(@alignCast(ctx));
+    return fai.fetchSeq(allocator, chr, beg, end) catch null;
+}
 
 const usage_text =
     \\
@@ -341,19 +348,25 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
         out_file.writeAll("\n") catch {};
     }
 
+    // ---- Open FASTA reference ----
+    const fasta_z = blk: {
+        var buf: [4096]u8 = undefined;
+        const fname = opts.fasta_fname.?;
+        if (fname.len >= buf.len) {
+            stderr_file.writeAll("Error: fasta path too long\n") catch {};
+            std.process.exit(1);
+        }
+        @memcpy(buf[0..fname.len], fname);
+        buf[fname.len] = 0;
+        break :blk buf[0..fname.len :0];
+    };
+    var fai = htslib.HtsFaidx.open(fasta_z) catch {
+        std.debug.print("Error: failed to open FASTA reference '{s}'\n", .{opts.fasta_fname.?});
+        std.process.exit(1);
+    };
+    defer fai.close();
+
     // ---- Initialize CSQ context ----
-    // NOTE: fai_ptr and fetch_seq_fn are left null here.  When htslib is
-    // available at link time, open the FASTA index and pass it in:
-    //
-    //   const htslib = @import("vcf/htslib.zig");
-    //   var fai = try htslib.HtsFaidx.open(opts.fasta_fname_z);
-    //   defer fai.close();
-    //   ...
-    //   .fai_ptr = @ptrCast(&fai),
-    //   .fetch_seq_fn = &htsFaidxFetchAdapter,
-    //
-    // For now the text VCF path works without reference lookup; CDS
-    // consequence annotation will be skipped when fai_ptr is null.
     var csq_ctx = CsqContext.init(allocator, .{
         .gff_fname = opts.gff_fname.?,
         .fasta_fname = opts.fasta_fname.?,
@@ -364,6 +377,8 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
         .bcsq_tag = opts.custom_tag,
         .ncsq2_max = opts.ncsq * 2,
         .brief_predictions = opts.brief_predictions,
+        .fai_ptr = @ptrCast(&fai),
+        .fetch_seq_fn = &htsFaidxFetchAdapter,
     }) catch |err| {
         std.debug.print("Error: failed to initialize CSQ context: {}\n", .{err});
         std.process.exit(1);
