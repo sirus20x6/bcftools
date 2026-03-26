@@ -10,6 +10,10 @@ pub const core_allocator = @import("core/allocator.zig");
 pub const core_buffer = @import("core/buffer.zig");
 pub const core_region = @import("core/region.zig");
 pub const core_hash = @import("core/hash.zig");
+pub const csq_format = @import("csq/format.zig");
+pub const csq_pipeline = @import("csq/csq.zig");
+pub const vcf_record = @import("vcf/record.zig");
+pub const vcf_reader = @import("vcf/reader.zig");
 
 // Version
 pub const version = "0.1.0";
@@ -61,4 +65,8 @@ comptime {
     _ = haplotype;
     _ = core_buffer;
     _ = core_region;
+    _ = csq_format;
+    _ = csq_pipeline;
+    _ = vcf_record;
+    _ = vcf_reader;
 }

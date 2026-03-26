@@ -529,47 +529,217 @@ pub fn hapAddCsq(
 // hapInit — initialize a haplotype tree node for a variant (skeleton)
 // ---------------------------------------------------------------------------
 
-/// Initialize a haplotype node for a variant.
+/// Initialize a haplotype node for a variant overlapping a CDS exon.
 ///
-/// This is a skeleton of the C `hap_init()` function.  The full implementation
-/// requires the splice analysis subsystem and the reference sequence buffers
-/// which are not yet ported.
+/// Ported from the C `hap_init()` function (csq.c lines 1596-1743).
 ///
-/// TODO:
-///   - Integrate splice_csq() to check for splice donor/acceptor/region
-///   - Build the spliced CDS sequence for HAP_CDS nodes
-///   - Handle exon-boundary overlap and skipped exons
-///   - Set up the var_str ("ref>alt") on the node
+/// Steps:
+///   1. Run splice analysis to check donor/acceptor/region/start/stop.
+///   2. If no coding impact (splice-only), create HAP_SSS node and return .added.
+///   3. If the variant overlaps coding sequence, build the spliced CDS sequence
+///      incorporating the variant and create a HAP_CDS node.
+///   4. If overlapping variants are detected, return .overlapping.
 pub fn hapInit(
     allocator: Allocator,
     parent: *HapNode,
     child: *HapNode,
-    cds_icds: u32,
+    cds: *const gff_types.CdsEntry,
     rec_pos: u32,
     ref_allele: []const u8,
     alt_allele: []const u8,
     ial: u32,
+    tscript_aux: *const types.Tscript,
 ) !HapInitResult {
-    _ = allocator;
-    child.icds = cds_icds;
+    const tr = cds.tr;
+    child.icds = cds.icds;
     child.vcf_ial = @intCast(ial);
 
-    // TODO: splice_init / splice_csq — determine splice consequences
-    // TODO: if SPLICE_VAR_REF => return .discarded
-    // TODO: if SPLICE_OUTSIDE/OVERLAP and no csq => return .discarded
-    // TODO: if splice-only => set child to HAP_SSS, return .added
+    // ── Step 1: splice analysis ────────────────────────────────────
 
-    // TODO: Build the CDS spliced sequence for the child node:
-    //   - If parent is HAP_CDS on the same exon, bridge the gap
-    //   - If on a new exon, finish the previous exon and skip intervening ones
-    //   - Append the alt allele
-    //   - Detect overlapping variants (return .overlapping)
+    const splice_mod = @import("splice.zig");
+    var splice = splice_mod.Splice.init(allocator, tr);
+    defer splice.deinit();
 
-    // Set basic fields that don't require splice analysis
-    child.rbeg = rec_pos;
+    splice.reset(
+        @intCast(rec_pos),
+        @intCast(ref_allele.len),
+        @intCast(ial),
+        ref_allele,
+        alt_allele,
+    );
+    splice.vcf.alen = @intCast(alt_allele.len);
+    splice.flags = .{
+        .check_acceptor = true,
+        .check_donor = true,
+        .set_refalt = true,
+        .check_utr = true,
+        .check_start = false,
+        .check_stop = false,
+        .check_region_beg = cds.icds != 0,
+        .check_region_end = cds.icds != tr.cds.items.len - 1,
+    };
+
+    // Check start codon: first exon on the coding strand
+    if (tr.trim != .prime5) {
+        if (tr.strand == .forward and cds.icds == 0)
+            splice.flags.check_start = true;
+        if (tr.strand == .reverse and cds.icds == tr.cds.items.len - 1)
+            splice.flags.check_start = true;
+    }
+    // Check stop codon: last exon on the coding strand
+    if (tr.trim != .prime3) {
+        if (tr.strand == .forward and cds.icds == tr.cds.items.len - 1)
+            splice.flags.check_stop = true;
+        if (tr.strand == .reverse and cds.icds == 0)
+            splice.flags.check_stop = true;
+    }
+
+    // Verify start codon is actually M before checking for start_lost
+    if (splice.flags.check_start) {
+        if (tscript_aux.ref_seq) |ref_seq| {
+            const translate_mod = @import("translate.zig");
+            if (tr.strand == .forward) {
+                const off = n_ref_pad + cds.beg -| tr.beg;
+                if (off + 3 <= ref_seq.len) {
+                    const stop_ch = translate_mod.dna2stop(translate_mod.findGeneticCode(0) orelse unreachable, ref_seq[off..][0..3]);
+                    if (stop_ch == null or stop_ch.? != 'M')
+                        splice.flags.check_start = false;
+                }
+            } else if (tr.strand == .reverse) {
+                const off = n_ref_pad + cds.beg -| tr.beg + cds.len -| 3;
+                if (off + 3 <= ref_seq.len) {
+                    const stop_ch = translate_mod.cdna2stop(translate_mod.findGeneticCode(0) orelse unreachable, ref_seq[off..][0..3]);
+                    if (stop_ch == null or stop_ch.? != 'M')
+                        splice.flags.check_start = false;
+                }
+            }
+        }
+    }
+
+    // Run splice consequence analysis
+    const ret = splice.spliceCsq(cds.beg, cds.beg + cds.len - 1);
+
+    // ── Step 2: handle non-coding results ──────────────────────────
+
+    if (ret == .var_ref) return .discarded; // not a variant
+
+    if (ret == .outside or ret == .overlap) {
+        if (splice.csq.toInt() == 0) return .discarded; // fully intronic
+
+        // Splice region/acceptor/donor: create HAP_SSS node
+        child.payload = .{ .sss = {} };
+        child.sbeg = 0;
+        child.rbeg = rec_pos;
+        child.rlen = 0;
+        child.dlen = 0;
+
+        // Build "ref>alt" string
+        const var_str = try allocator.alloc(u8, ref_allele.len + 1 + alt_allele.len);
+        @memcpy(var_str[0..ref_allele.len], ref_allele);
+        var_str[ref_allele.len] = '>';
+        @memcpy(var_str[ref_allele.len + 1 ..], alt_allele);
+        child.var_str = var_str;
+
+        child.csq = splice.csq;
+        return .added;
+    }
+
+    // Clear synonymous if set by splice (will be re-evaluated after translation)
+    if (splice.csq.synonymous_variant)
+        splice.csq.synonymous_variant = false;
+
+    // ── Step 3: build the spliced CDS sequence ─────────────────────
+
+    // Handle variant overlapping exon boundary: trim to exon
+    var dbeg: u32 = 0;
+    if (splice.ref_beg < cds.beg) {
+        dbeg = cds.beg - splice.ref_beg;
+        splice.ref_beg = cds.beg;
+    }
+
+    // Parent must not be HAP_SSS for CDS sequence building
+    std.debug.assert(parent.payload != .sss);
+
+    var seq_buf: ArrayList(u8) = .empty;
+
+    const ref_seq = tscript_aux.ref_seq orelse return .discarded;
+
+    if (parent.payload == .cds) {
+        const parent_icds = parent.icds;
+
+        if (parent_icds != cds.icds) {
+            // Variant is on a new exon: finish the previous exon
+            const prev_cds = tr.cds.items[parent_icds];
+            const prev_exon_end = prev_cds.beg + prev_cds.len;
+            const parent_var_end = parent.rbeg + @as(u32, @intCast(@max(@as(i32, 0), parent.rlen)));
+            if (prev_exon_end > parent_var_end) {
+                const len = prev_exon_end - parent_var_end;
+                const src_off = n_ref_pad + parent_var_end -| tr.beg;
+                if (src_off + len <= ref_seq.len)
+                    try seq_buf.appendSlice(allocator, ref_seq[src_off .. src_off + len]);
+            }
+
+            // Append any skipped non-variant exons
+            var i: u32 = parent_icds + 1;
+            while (i < cds.icds) : (i += 1) {
+                const skip_cds = tr.cds.items[i];
+                const src_off = n_ref_pad + skip_cds.beg -| tr.beg;
+                if (src_off + skip_cds.len <= ref_seq.len)
+                    try seq_buf.appendSlice(allocator, ref_seq[src_off .. src_off + skip_cds.len]);
+            }
+        }
+
+        if (parent_icds == child.icds) {
+            // Same exon: append reference gap between parent variant end and this variant
+            const parent_var_end = parent.rbeg + @as(u32, @intCast(@max(@as(i32, 0), parent.rlen)));
+            if (splice.ref_beg < parent_var_end) {
+                // Overlapping variants
+                seq_buf.deinit(allocator);
+                return .overlapping;
+            }
+            const gap = splice.ref_beg - parent_var_end;
+            if (gap > 0) {
+                const src_off = n_ref_pad + parent_var_end -| tr.beg;
+                if (src_off + gap <= ref_seq.len)
+                    try seq_buf.appendSlice(allocator, ref_seq[src_off .. src_off + gap]);
+            }
+        } else {
+            // Different exon: reference from start of new exon to variant
+            const gap = splice.ref_beg - cds.beg;
+            if (gap > 0) {
+                const src_off = n_ref_pad + cds.beg -| tr.beg;
+                if (src_off + gap <= ref_seq.len)
+                    try seq_buf.appendSlice(allocator, ref_seq[src_off .. src_off + gap]);
+            }
+        }
+    }
+
+    // Append the alternate allele (trimmed by dbeg for exon-boundary overlap)
+    if (splice.kalt.items.len > dbeg)
+        try seq_buf.appendSlice(allocator, splice.kalt.items[dbeg..]);
+
+    // Populate the child node as HAP_CDS
+    const owned_seq = try seq_buf.toOwnedSlice(allocator);
+    child.payload = .{ .cds = .{ .seq = owned_seq } };
+    child.sbeg = cds.pos + (splice.ref_beg - cds.beg);
+    child.rbeg = splice.ref_beg;
+    child.rlen = @intCast(splice.kref.items.len);
+    child.prev = parent;
+    child.csq = splice.csq;
+
+    // Set dlen and build "ref>alt" string
     child.dlen = @as(i32, @intCast(alt_allele.len)) - @as(i32, @intCast(ref_allele.len));
+    const var_str = try allocator.alloc(u8, ref_allele.len + 1 + alt_allele.len);
+    @memcpy(var_str[0..ref_allele.len], ref_allele);
+    var_str[ref_allele.len] = '>';
+    @memcpy(var_str[ref_allele.len + 1 ..], alt_allele);
+    child.var_str = var_str;
 
-    _ = parent;
+    // If the whole CDS is modified/deleted, demote to HAP_SSS
+    if (child.rbeg + @as(u32, @intCast(@max(@as(i32, 0), child.rlen))) > cds.beg + cds.len) {
+        child.payload = .{ .sss = {} };
+        if (child.csq.toInt() == 0) child.csq.coding_sequence = true;
+    }
 
     return .added;
 }
