@@ -86,6 +86,26 @@ pub const N_REF_PAD = 10;
 pub const POS_MAX: u32 = std.math.maxInt(u32);
 
 // ---------------------------------------------------------------------------
+// Module-level GFF pointer for format callbacks
+// ---------------------------------------------------------------------------
+
+/// Module-level GFF parser reference used by the trid/biotype format callbacks.
+/// Set by CsqContext.init when the GFF is available.
+var g_gff_ptr: ?*GffParser = null;
+
+fn tridToStringCallback(trid: u32) []const u8 {
+    if (g_gff_ptr) |gff| {
+        return gff.id2string(trid);
+    }
+    return "";
+}
+
+fn biotypeToStringCallback(biotype_id: u32) []const u8 {
+    const biotype: gff_types.Biotype = @enumFromInt(biotype_id);
+    return biotype.toGffString();
+}
+
+// ---------------------------------------------------------------------------
 // Phase handling
 // ---------------------------------------------------------------------------
 
@@ -295,6 +315,26 @@ pub const Vrec = struct {
         if (self.fmt_bm) |bm| {
             allocator.free(bm);
             self.fmt_bm = null;
+        }
+        // Free the owned VcfRecord (heap-allocated by vbufPush)
+        if (self.rec) |rec_ptr| {
+            // Free deep-copied slices
+            for (rec_ptr.alleles) |a| {
+                allocator.free(a);
+            }
+            if (rec_ptr.alleles.len > 0) {
+                allocator.free(rec_ptr.alleles);
+            }
+            if (rec_ptr.chr.len > 0) {
+                allocator.free(rec_ptr.chr);
+            }
+            if (rec_ptr.raw_line) |rl| {
+                allocator.free(rl);
+            }
+            // rec is *const VcfRecord, need to cast to free
+            const mutable: *VcfRecord = @constCast(rec_ptr);
+            allocator.destroy(mutable);
+            self.rec = null;
         }
     }
 };
@@ -552,6 +592,9 @@ pub const CsqContext = struct {
             gff_ptr = gff_obj;
             owns_gff = true;
         }
+
+        // Set module-level GFF pointer for format callbacks
+        g_gff_ptr = gff_ptr;
 
         return CsqContext{
             .allocator = allocator,
@@ -940,9 +983,31 @@ pub const CsqContext = struct {
             _ = try self.vcf_rbuf.append(vbuf);
         }
 
+        // Heap-allocate a copy of the VcfRecord so it outlives the caller's stack.
+        // The pipeline buffers records and flushes them later, so the record must
+        // remain valid until vbufFlush processes it.
+        const owned_rec = try self.allocator.create(VcfRecord);
+        owned_rec.* = rec.*;
+        // Deep-copy the alleles slice (points into caller's scratch buffer)
+        if (rec.alleles.len > 0) {
+            const alleles_copy = try self.allocator.alloc([]const u8, rec.alleles.len);
+            for (rec.alleles, 0..) |a, ai| {
+                alleles_copy[ai] = try self.allocator.dupe(u8, a);
+            }
+            owned_rec.alleles = alleles_copy;
+        }
+        // Deep-copy chr slice
+        if (rec.chr.len > 0) {
+            owned_rec.chr = try self.allocator.dupe(u8, rec.chr);
+        }
+        // Deep-copy raw_line
+        if (rec.raw_line) |rl| {
+            owned_rec.raw_line = try self.allocator.dupe(u8, rl);
+        }
+
         // Add the record as a new Vrec
         var vrec = Vrec{};
-        vrec.rec = rec;
+        vrec.rec = owned_rec;
         try vbuf.vrecs.append(self.allocator, vrec);
 
         // Register in pos2vbuf for O(1) existence check by position
@@ -960,8 +1025,9 @@ pub const CsqContext = struct {
     /// after each vbufFlush call and inject the BCSQ value into the VCF
     /// line before writing.
     pub const FlushedRecord = struct {
-        /// The original VCF record (pipeline type).
-        rec: *const VcfRecord,
+        /// Position and rid for looking up the original VCF line.
+        pos: u32 = 0,
+        rid: i32 = 0,
         /// Formatted BCSQ value, e.g. "missense|GENE|TR|protein_coding|+|5T>5I|100A>G".
         /// Null means no consequences — write the record as-is.
         bcsq_value: ?[]const u8 = null,
@@ -1006,7 +1072,8 @@ pub const CsqContext = struct {
                 if (vrec.vcsqs.items.len == 0) {
                     // No consequences — record passes through unmodified
                     try self.flushed_records.append(self.allocator, .{
-                        .rec = rec_ptr,
+                        .pos = rec_ptr.pos,
+                        .rid = rec_ptr.rid,
                     });
                     continue;
                 }
@@ -1015,7 +1082,11 @@ pub const CsqContext = struct {
                 self.output.clearRetainingCapacity();
                 try formatVcsqList(
                     vrec.vcsqs.items,
-                    .{ .brief_predictions = self.brief_predictions },
+                    .{
+                        .brief_predictions = self.brief_predictions,
+                        .trid_to_string = &tridToStringCallback,
+                        .biotype_to_string = &biotypeToStringCallback,
+                    },
                     self.output.writer(self.allocator),
                 );
 
@@ -1023,7 +1094,8 @@ pub const CsqContext = struct {
                 const bcsq_str = try self.allocator.dupe(u8, self.output.items);
 
                 try self.flushed_records.append(self.allocator, .{
-                    .rec = rec_ptr,
+                    .pos = rec_ptr.pos,
+                    .rid = rec_ptr.rid,
                     .bcsq_value = bcsq_str,
                     .fmt_bm = vrec.fmt_bm,
                     .nfmt = vrec.nfmt,
@@ -1083,6 +1155,14 @@ pub const CsqContext = struct {
                     std.log.warn("hapFinalize failed for transcript {d}: {}", .{ tr.id, err });
                 };
 
+                // Transfer consequences from haplotype tree leaf nodes into vbuf vrecs.
+                // hapFinalize populates csq_list on leaf nodes (types.Csq), but the
+                // pipeline vbuf uses format.Vcsq. We walk the tree and push each
+                // consequence into the matching vrec by position.
+                self.transferTreeCsqToVbuf(root, tr) catch |err| {
+                    std.log.warn("transferTreeCsqToVbuf failed for transcript {d}: {}", .{ tr.id, err });
+                };
+
                 // Stage per-sample VCF consequences (unless DROP_GT mode)
                 if (self.phase != .drop_gt) {
                     const n_smpl = self.n_samples;
@@ -1108,6 +1188,108 @@ pub const CsqContext = struct {
             // vbuf_flush still needs the transcript data for by-position output)
             try self.rm_transcripts.append(self.allocator, tr);
         }
+    }
+
+    /// Walk the haplotype tree (DFS) and transfer consequences from leaf nodes
+    /// into the vbuf vrecs.
+    ///
+    /// After hapFinalize, leaf nodes have csq_list populated with types.Csq entries.
+    /// These need to be converted to format.Vcsq and pushed into the pipeline's
+    /// Vrec.vcsqs so that vbufFlush can format the BCSQ string.
+    fn transferTreeCsqToVbuf(self: *CsqContext, root: *HapNode, tr: *Transcript) !void {
+        // DFS traversal using an explicit stack
+        var stack: std.ArrayList(*HapNode) = .empty;
+        defer stack.deinit(self.allocator);
+        try stack.append(self.allocator, root);
+
+        while (stack.items.len > 0) {
+            const node = stack.pop() orelse break;
+
+            // Push children for further traversal
+            for (node.children.items) |child| {
+                try stack.append(self.allocator, child);
+            }
+
+            // Process consequences on this node
+            if (node.csq_list.items.len == 0) continue;
+
+            for (node.csq_list.items) |csq_entry| {
+                // Convert types.Vcsq -> format.Vcsq
+                const vcsq = Vcsq{
+                    .csq_type = csq_entry.type_info.csq_type.toInt(),
+                    .biotype = csq_entry.type_info.biotype,
+                    .strand = if (csq_entry.type_info.strand) .fwd else .rev,
+                    .trid = csq_entry.type_info.trid,
+                    .vcf_ial = csq_entry.type_info.vcf_ial,
+                    .gene = csq_entry.type_info.gene,
+                    .vstr = if (csq_entry.type_info.vstr.items.len > 0)
+                        csq_entry.type_info.vstr.items
+                    else
+                        null,
+                };
+
+                // Find the vbuf at this position and push the consequence
+                try self.pushCsqToVbufByPos(csq_entry.pos, vcsq, tr);
+            }
+        }
+    }
+
+    /// Push a consequence into the vbuf vrec matching the given position.
+    /// Unlike csqPush which requires pointer identity, this matches by position
+    /// and allele index to find the correct vrec.
+    fn pushCsqToVbufByPos(self: *CsqContext, rec_pos: u32, vcsq: Vcsq, tr: *Transcript) !void {
+        _ = tr;
+
+        // Find the vbuf at this position
+        var vbuf: ?*Vbuf = null;
+        for (0..self.vcf_rbuf.len) |k| {
+            const candidate = self.vcf_rbuf.kth(k);
+            if (candidate.pos()) |p| {
+                if (p == rec_pos) {
+                    vbuf = candidate;
+                    break;
+                }
+            }
+        }
+        const vb = vbuf orelse return; // record may have already been flushed
+
+        // Find the vrec matching this allele.
+        // For multi-allelic sites, match by vcf_ial; for biallelic, use the first vrec.
+        var target_vrec: ?*Vrec = null;
+        for (vb.vrecs.items) |*vrec| {
+            const rec_ptr = vrec.rec orelse continue;
+            // Match: the vrec's record must have enough alleles for this ial
+            if (vcsq.vcf_ial < rec_ptr.n_allele) {
+                target_vrec = vrec;
+                break;
+            }
+        }
+        if (target_vrec == null and vb.vrecs.items.len > 0) {
+            // Fallback: use the first vrec at this position
+            target_vrec = &vb.vrecs.items[0];
+        }
+        const vrec = target_vrec orelse return;
+
+        // Apply type masking rules (same as csqPush)
+        var t = vcsq.csq_type;
+        if (t & CSQ_INFRAME_INSERTION != 0 and t & CSQ_ELONGATION != 0) t &= ~CSQ_INFRAME_INSERTION;
+        if (t & CSQ_INFRAME_DELETION != 0 and t & CSQ_TRUNCATION != 0) t &= ~CSQ_INFRAME_DELETION;
+        if (t & CSQ_SPLICE_REGION != 0 and t & (CSQ_SPLICE_DONOR | CSQ_SPLICE_ACCEPTOR) != 0) {
+            t &= ~CSQ_SPLICE_REGION;
+        }
+        var masked_vcsq = vcsq;
+        masked_vcsq.csq_type = t;
+
+        // Deduplication: check if an identical consequence already exists
+        for (vrec.vcsqs.items) |*existing| {
+            if (isDuplicate(existing, &masked_vcsq)) {
+                existing.csq_type |= t;
+                return;
+            }
+        }
+
+        // Append new consequence
+        try vrec.vcsqs.append(self.allocator, masked_vcsq);
     }
 
     /// Stage VCF consequence bitmask bits for a single sample/haplotype leaf node.
@@ -2068,12 +2250,16 @@ pub const CsqContext = struct {
         }
         const vb = vbuf orelse return error.VbufNotFound;
 
-        // Find the vrec matching this record
+        // Find the vrec matching this record.
+        // Match by position + allele count since the stored record is a
+        // heap-allocated copy (not the same pointer as the caller's rec).
         var vrec_idx: ?usize = null;
         for (vb.vrecs.items, 0..) |*vrec, idx| {
-            if (vrec.rec == rec) {
-                vrec_idx = idx;
-                break;
+            if (vrec.rec) |stored_rec| {
+                if (stored_rec.pos == rec.pos and stored_rec.n_allele == rec.n_allele and stored_rec.rid == rec.rid) {
+                    vrec_idx = idx;
+                    break;
+                }
             }
         }
         const vi = vrec_idx orelse return error.VrecNotFound;

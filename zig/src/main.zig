@@ -217,7 +217,7 @@ fn writeFlushedRecords(
 ) !void {
     for (csq_ctx.flushed_records.items) |fr| {
         // Build a lookup key: combine rid + pos to handle multi-chrom inputs
-        const key = posKey(fr.rec.rid, fr.rec.pos);
+        const key = posKey(fr.rid, fr.pos);
         const original_line = line_map.get(key) orelse continue;
 
         try writeVcfLine(allocator, out, original_line, fr.bcsq_value, csq_ctx.bcsq_tag);
