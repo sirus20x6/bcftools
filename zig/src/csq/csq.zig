@@ -1044,6 +1044,31 @@ pub const CsqContext = struct {
         nfmt: u32 = 0,
     };
 
+    /// Comparison function for sorting consequences in BCSQ output.
+    /// Ordering priority (lower = first):
+    ///   0: PRINTED_UPSTREAM (@-references)
+    ///   1: Compound consequences (CDS-level with vstr)
+    ///   2: Non-compound splice-only consequences (splice_donor, splice_acceptor, splice_region)
+    ///   3: Non-compound (UTR, intron, non_coding, etc.)
+    /// This matches the C code's output ordering.
+    fn vcsqCmpLessThan(_: void, a: Vcsq, b: Vcsq) bool {
+        return vcsqSortKey(a) < vcsqSortKey(b);
+    }
+
+    fn vcsqSortKey(v: Vcsq) u3 {
+        if (v.csq_type & CSQ_PRINTED_UPSTREAM != 0) return 0;
+        // Splice-only consequences (no CDS overlap) — these are staged first in C
+        if (v.csq_type & (CSQ_SPLICE_ACCEPTOR | CSQ_SPLICE_DONOR | CSQ_SPLICE_REGION) != 0 and
+            v.csq_type & CSQ_COMPOUND == 0)
+            return 1;
+        // Compound (CDS-level) consequences
+        if (v.csq_type & CSQ_COMPOUND != 0) return 2;
+        // Non-coding/intron
+        if (v.csq_type & (CSQ_INTRON | CSQ_NON_CODING) != 0) return 4;
+        // UTR and other non-compound
+        return 3;
+    }
+
     /// Flush all buffered VCF records whose keep_until <= pos.
     /// Formats BCSQ strings and populates flushed_records.
     ///
@@ -1081,6 +1106,13 @@ pub const CsqContext = struct {
                         .rid = rec_ptr.rid,
                     });
                     continue;
+                }
+
+                // Sort consequences: compound (CDS-level) before non-compound
+                // (UTR, intron, splice-only). This matches the C code's output
+                // order where CDS consequences appear before UTR consequences.
+                if (vrec.vcsqs.items.len > 1) {
+                    std.mem.sort(Vcsq, vrec.vcsqs.items, {}, vcsqCmpLessThan);
                 }
 
                 // Format the BCSQ INFO string
@@ -1716,7 +1748,14 @@ pub const CsqContext = struct {
 
             if (gts.len == 0) continue;
 
-            const ngts: u32 = gts[0].ploidy;
+            // Use maximum ploidy across all samples (C uses ngt from
+            // bcf_get_genotypes which pads haploid samples with missing).
+            // This ensures diploid samples are fully processed even when
+            // some samples are haploid.
+            var ngts: u32 = 0;
+            for (gts) |g| {
+                if (g.ploidy > ngts) ngts = g.ploidy;
+            }
             if (ngts != 1 and ngts != 2) {
                 // Non-haploid/diploid: skip (warn once)
                 if (self.verbosity > 0) {
@@ -2177,7 +2216,30 @@ pub const CsqContext = struct {
                 );
 
                 const splice_ret = splice.spliceCsq(utr.beg, utr.end);
-                if (splice_ret != .inside and splice_ret != .overlap) continue;
+                if (splice_ret != .inside and splice_ret != .overlap) {
+                    // For insertions at the exact CDS/UTR boundary (e.g. last CDS base
+                    // where the insertion position equals the UTR start), spliceCsq
+                    // returns .outside but C stages the UTR consequence internally
+                    // (csq.c line 1101-1117, check_utr path from hapInit).
+                    // This only applies when the variant also overlaps a CDS (i.e.,
+                    // the insertion is at a CDS boundary, not intergenic).
+                    if (splice_ret == .outside and ref_allele.len < alt.len) {
+                        const last_ref_base = rec.pos + @as(u32, @intCast(ref_allele.len)) - 1;
+                        // Check: last ref base is adjacent to UTR AND overlaps a CDS
+                        var has_adjacent_cds = false;
+                        if (last_ref_base + 1 == utr.beg) {
+                            var cds_itr = gff.idx_cds.overlap(chr, rec.pos, rec.pos + rec.rlen);
+                            if (cds_itr.next() != null) has_adjacent_cds = true;
+                        }
+                        if (has_adjacent_cds) {
+                            // Stage UTR consequence for CDS/UTR boundary insertion
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
 
                 // Determine UTR type
                 const utr_csq: CsqType = if (utr.which == .prime5) CSQ_UTR5 else CSQ_UTR3;
@@ -2684,7 +2746,11 @@ pub const CsqContext = struct {
         }
         const genotypes = gts.?;
 
-        ngt = genotypes[0].ploidy;
+        // Use max ploidy across all samples (matches testCds)
+        ngt = 0;
+        for (genotypes) |g| {
+            if (g.ploidy > ngt) ngt = g.ploidy;
+        }
         if (ngt == 0 or ngt > 2) return;
 
         // VCF output: set bits in vrec.fmt_bm for matching samples

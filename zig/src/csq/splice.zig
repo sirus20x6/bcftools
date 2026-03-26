@@ -275,12 +275,14 @@ pub const Splice = struct {
     /// Check intronic region beyond the exon end (3' side in genomic coords).
     /// Sets splice_donor / splice_acceptor / splice_region as appropriate.
     fn checkIntronEnd(self: *Splice, ex_end: u32) void {
-        // Splice region: variant overlaps [ex_end+n_splice_donor .. ex_end+n_splice_region_intron)
-        if (self.ref_beg < ex_end + n_splice_region_intron and self.ref_end > ex_end + n_splice_donor) {
+        // Splice region: variant overlaps [ex_end+n_splice_donor .. ex_end+n_splice_region_intron]
+        // C: ref_beg <= ex_end + N_SPLICE_REGION_INTRON && ref_end > ex_end + N_SPLICE_DONOR
+        if (self.ref_beg <= ex_end + n_splice_region_intron and self.ref_end > ex_end + n_splice_donor) {
             self.csq.splice_region = true;
         }
-        // Splice donor/acceptor: variant overlaps [ex_end .. ex_end+n_splice_donor)
-        if (self.ref_beg < ex_end + n_splice_donor) {
+        // Splice donor/acceptor: variant overlaps [ex_end .. ex_end+n_splice_donor]
+        // C: ref_beg <= ex_end + N_SPLICE_DONOR
+        if (self.ref_beg <= ex_end + n_splice_donor) {
             if (self.flags.check_donor and self.tr.strand == .forward)
                 self.csq.splice_donor = true;
             if (self.flags.check_acceptor and self.tr.strand == .reverse)
@@ -292,11 +294,13 @@ pub const Splice = struct {
     /// Sets splice_donor / splice_acceptor / splice_region as appropriate.
     fn checkIntronBeg(self: *Splice, ex_beg: u32) void {
         // Splice region: variant overlaps [ex_beg-n_splice_region_intron .. ex_beg-n_splice_donor)
-        if (self.ref_end > ex_beg - n_splice_region_intron and self.ref_beg < ex_beg - n_splice_donor) {
+        // C: ref_end >= ex_beg - N_SPLICE_REGION_INTRON && ref_beg < ex_beg - N_SPLICE_DONOR
+        if (self.ref_end >= ex_beg - n_splice_region_intron and self.ref_beg < ex_beg - n_splice_donor) {
             self.csq.splice_region = true;
         }
         // Splice donor/acceptor: variant overlaps [ex_beg-n_splice_donor .. ex_beg)
-        if (self.ref_end > ex_beg - n_splice_donor) {
+        // C: ref_end >= ex_beg - N_SPLICE_DONOR
+        if (self.ref_end >= ex_beg - n_splice_donor) {
             if (self.flags.check_donor and self.tr.strand == .reverse)
                 self.csq.splice_donor = true;
             if (self.flags.check_acceptor and self.tr.strand == .forward)

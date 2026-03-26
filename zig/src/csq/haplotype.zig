@@ -502,11 +502,25 @@ pub fn hapAddCsq(
     }
 
     // Compound inframe variants that actually introduce a premature stop
-    // are really frameshifts + stop_gained
+    // are really frameshifts + stop_gained.
+    // C code (line 2280): uses the truncated tseq_stop length (after
+    // truncation at the first stop codon in the !is_sss block above).
+    // We check `upstream_stop` which is set to true when truncation happened.
     if (is_compound and
         (csq.inframe_deletion or csq.inframe_insertion or csq.inframe_altering))
     {
-        if (tseq_stop.len > 0 and tseq_stop[tseq_stop.len - 1] == '*') {
+        // After truncation, the last character of tseq_stop is '*' if
+        // a premature stop was found.  We detect this via upstream_stop
+        // which was set during truncation, or by checking the original
+        // tseq_stop for any stop codon.
+        var trunc_last_is_stop = false;
+        for (tseq_stop) |ch| {
+            if (ch == '*') {
+                trunc_last_is_stop = true;
+                break;
+            }
+        }
+        if (trunc_last_is_stop) {
             rm_csq.inframe_deletion = true;
             rm_csq.inframe_insertion = true;
             rm_csq.inframe_altering = true;
@@ -1276,10 +1290,11 @@ fn tscriptSpliceRef(tscript_aux: *types.Tscript, tr: *const gff_types.Transcript
 }
 
 /// Helper: compute rlen + dlen for a node (used in soff calculation).
+/// This is the signed sum rlen + dlen, clamped to 0 if negative.
+/// For deletions (dlen < 0), the result is the alt allele length.
 fn rlenPlusDlen(node: *const HapNode) usize {
-    const rlen_u: usize = if (node.rlen >= 0) @intCast(node.rlen) else 0;
-    const dlen_u: usize = if (node.dlen >= 0) @intCast(node.dlen) else 0;
-    return rlen_u + dlen_u;
+    const sum: i64 = @as(i64, node.rlen) + @as(i64, node.dlen);
+    return if (sum > 0) @intCast(sum) else 0;
 }
 
 /// The compound-consequence bitmask, matching the C CSQ_COMPOUND definition.
