@@ -3,7 +3,9 @@ const std = @import("std");
 // Module re-exports
 pub const csq_types = @import("csq/types.zig");
 pub const gff_types = @import("gff/types.zig");
+pub const gff = @import("gff/gff.zig");
 pub const translate = @import("csq/translate.zig");
+pub const haplotype = @import("csq/haplotype.zig");
 pub const core_allocator = @import("core/allocator.zig");
 pub const core_buffer = @import("core/buffer.zig");
 pub const core_region = @import("core/region.zig");
@@ -54,7 +56,9 @@ export fn bcftools_csq_destroy(_ctx: ?*anyopaque) void {
 comptime {
     _ = csq_types;
     _ = gff_types;
+    _ = gff;
     _ = translate;
+    _ = haplotype;
     _ = core_buffer;
     _ = core_region;
 }
