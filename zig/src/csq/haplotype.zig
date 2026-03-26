@@ -622,6 +622,9 @@ pub fn hapInit(
         }
     }
 
+    // Set transcript reference for shifted_del_synonymous and build_hap
+    splice.tr_ref = tscript_aux.ref_seq;
+
     // Run splice consequence analysis
     const ret = splice.spliceCsq(cds.beg, cds.beg + cds.len - 1);
 
@@ -636,6 +639,7 @@ pub fn hapInit(
         child.payload = .{ .sss = {} };
         child.sbeg = 0;
         child.rbeg = rec_pos;
+        child.rec_pos = rec_pos;
         child.rlen = 0;
         child.dlen = 0;
 
@@ -729,6 +733,7 @@ pub fn hapInit(
     child.payload = .{ .cds = .{ .seq = owned_seq } };
     child.sbeg = cds.pos + (splice.ref_beg - cds.beg);
     child.rbeg = splice.ref_beg;
+    child.rec_pos = rec_pos; // original VCF position for consequence output
     child.rlen = @intCast(splice.kref.items.len);
     child.prev = parent;
     child.csq = splice.csq;
@@ -868,7 +873,7 @@ pub fn hapFinalize(ctx: *HapContext) !void {
         if (child_node.payload == .sss) {
             // SSS-only leaf: record splice consequence without variant string
             const csq_entry_sss: types.Csq = .{
-                .pos = child_node.rbeg,
+                .pos = child_node.rec_pos,
                 .type_info = .{
                     .csq_type = child_node.csq,
                     .trid = tr_ptr.id,
@@ -968,7 +973,7 @@ pub fn hapFinalize(ctx: *HapContext) !void {
                     const node_splice_bits = stack[ibeg_u].node.?.csq.toInt();
                     merged_csq = CsqType.fromInt(merged_csq.toInt() | node_splice_bits);
                     var csq_entry: types.Csq = .{
-                        .pos = stack[ibeg_u].node.?.rbeg,
+                        .pos = stack[ibeg_u].node.?.rec_pos,
                         .type_info = .{
                             .csq_type = merged_csq,
                             .trid = tr_ptr.id,
@@ -1008,7 +1013,7 @@ pub fn hapFinalize(ctx: *HapContext) !void {
                 }
 
                 var csq_entry: types.Csq = .{
-                    .pos = stack[if (tr_ptr.strand == .forward) ibeg_u else i].node.?.rbeg,
+                    .pos = stack[if (tr_ptr.strand == .forward) ibeg_u else i].node.?.rec_pos,
                     .type_info = .{
                         .csq_type = csq_result.csq_type,
                         .trid = tr_ptr.id,
@@ -1040,7 +1045,7 @@ pub fn hapFinalize(ctx: *HapContext) !void {
                         const node_csq_raw = node_j.csq.toInt();
                         upstream_csq = types.CsqType.fromInt(upstream_csq.toInt() | node_csq_raw);
                         const upstream_entry: types.Csq = .{
-                            .pos = node_j.rbeg,
+                            .pos = node_j.rec_pos,
                             .ref_pos = ref_node_pos_1based,
                             .type_info = .{
                                 .csq_type = upstream_csq,
@@ -1140,7 +1145,7 @@ pub fn hapFinalize(ctx: *HapContext) !void {
                     const node_splice_bits = stack[i].node.?.csq.toInt();
                     merged_csq_rev = CsqType.fromInt(merged_csq_rev.toInt() | node_splice_bits);
                     var csq_entry_sss: types.Csq = .{
-                        .pos = stack[i].node.?.rbeg,
+                        .pos = stack[i].node.?.rec_pos,
                         .type_info = .{
                             .csq_type = merged_csq_rev,
                             .trid = tr_ptr.id,
@@ -1178,7 +1183,7 @@ pub fn hapFinalize(ctx: *HapContext) !void {
                 }
 
                 var csq_entry: types.Csq = .{
-                    .pos = stack[ibeg_u].node.?.rbeg,
+                    .pos = stack[ibeg_u].node.?.rec_pos,
                     .type_info = .{
                         .csq_type = csq_result.csq_type,
                         .trid = tr_ptr.id,
@@ -1207,7 +1212,7 @@ pub fn hapFinalize(ctx: *HapContext) !void {
                         const node_csq_raw = node_j.csq.toInt();
                         upstream_csq = types.CsqType.fromInt(upstream_csq.toInt() | node_csq_raw);
                         const upstream_entry: types.Csq = .{
-                            .pos = node_j.rbeg,
+                            .pos = node_j.rec_pos,
                             .ref_pos = ref_node_pos_1based,
                             .type_info = .{
                                 .csq_type = upstream_csq,
@@ -1318,16 +1323,25 @@ fn buildVstr(
     tr: *const gff_types.Transcript,
     csq_type: CsqType,
 ) !void {
-    _ = seq_m;
-
     const rbeg_val = stack[ibeg].node.?.sbeg;
     const rend_val = stack[iend].node.?.sbeg + @as(u32, @intCast(@max(@as(i32, 0), stack[iend].node.?.rlen)));
     _ = rend_val;
 
+    // node2soff(i) = stack[i].slen - (stack[i].node.rlen + stack[i].node.dlen)
+    // node2sbeg(i) = ctx.sbeg + node2soff(i)
+    // node2send(i) = ctx.sbeg + stack[i].slen
     const aa_rbeg: usize = if (tr.strand == .forward)
         rbeg_val / 3 + 1
     else
         (sref_len -| 2 * n_ref_pad -| (stack[iend].node.?.sbeg + @as(u32, @intCast(@max(@as(i32, 0), stack[iend].node.?.rlen))))) / 3 + 1;
+
+    // aa_sbeg uses the spliced (alt) position, which accounts for indels
+    const soff_ibeg = stack[ibeg].slen -| rlenPlusDlen(stack[ibeg].node.?);
+    const send_iend = stack[iend].slen;
+    const aa_sbeg: usize = if (tr.strand == .forward)
+        (ctx.sbeg + soff_ibeg) / 3 + 1
+    else
+        (seq_m -| (ctx.sbeg + send_iend)) / 3 + 1;
 
     try vstr.append(allocator, '|');
     {
@@ -1341,7 +1355,7 @@ fn buildVstr(
         try vstr.append(allocator, '>');
         {
             var buf: [32]u8 = undefined;
-            const s = std.fmt.bufPrint(&buf, "{d}", .{aa_rbeg}) catch return;
+            const s = std.fmt.bufPrint(&buf, "{d}", .{aa_sbeg}) catch return;
             try vstr.appendSlice(allocator, s);
         }
         try vstr.appendSlice(allocator, ctx.tseq.items);
@@ -1356,7 +1370,7 @@ fn buildVstr(
         first = false;
         const n = stack[i].node.?;
         var buf: [32]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "{d}", .{n.rbeg + 1}) catch return;
+        const s = std.fmt.bufPrint(&buf, "{d}", .{n.rec_pos + 1}) catch return;
         try vstr.appendSlice(allocator, s);
         if (n.var_str) |vs| try vstr.appendSlice(allocator, vs);
     }

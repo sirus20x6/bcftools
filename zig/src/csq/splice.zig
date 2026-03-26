@@ -526,11 +526,81 @@ pub const Splice = struct {
         return .inside;
     }
 
+    /// Check if a deletion near the start codon can be realigned such that
+    /// the start codon is preserved (synonymous start).
+    ///
+    /// Port of shifted_del_synonymous() from csq.c (line 1214).
+    fn shiftedDelSynonymous(self: *Splice, ex_beg: u32, ex_end: u32) bool {
+        const tr = self.tr;
+        const ref_allele = self.vcf.ref_allele;
+        const alt_allele = self.vcf.alt_allele;
+        const ref_len: i32 = @intCast(ref_allele.len);
+        const alt_len: i32 = @intCast(alt_allele.len);
+
+        if (ref_len <= alt_len) return false; // not a deletion
+        const ndel: i32 = ref_len - alt_len;
+
+        // Does the deletion overlap the start codon?
+        if (tr.strand == .reverse) {
+            if (self.vcf.pos + ref_len + 2 <= @as(i32, @intCast(ex_end))) return false;
+        } else if (tr.strand == .forward) {
+            if (self.vcf.pos >= @as(i32, @intCast(ex_beg)) + 3) return false;
+        } else return false;
+
+        const tscript_ref = self.tr_ref orelse return false;
+        const alt_len_u: usize = @intCast(alt_len);
+
+        if (tr.strand == .reverse) {
+            // Check that the deleted bases can be replaced by the reference bases
+            // immediately after the deletion
+            const vcf_ref_end: i64 = @as(i64, self.vcf.pos) + ref_len - 1;
+            const tr_ref_end: i64 = @as(i64, tr.end) + n_ref_pad;
+            if (vcf_ref_end + ndel > tr_ref_end) return false;
+
+            // ptr_vcf: first deleted base in REF (starting at alt_len offset)
+            // ptr_ref: reference bases after the deletion end
+            const ptr_ref_off = @as(i64, n_ref_pad) + (vcf_ref_end + 1) - @as(i64, tr.beg);
+            if (ptr_ref_off < 0) return false;
+            const ptr_ref_start: usize = @intCast(ptr_ref_off);
+
+            var i: usize = 0;
+            while (alt_len_u + i < ref_allele.len) : (i += 1) {
+                if (ptr_ref_start + i >= tscript_ref.len) return false;
+                if (ref_allele[alt_len_u + i] != tscript_ref[ptr_ref_start + i]) return false;
+            }
+        } else {
+            // STRAND_FWD
+            const vcf_block_beg: i64 = @as(i64, self.vcf.pos) + ref_len - 2 * ndel;
+            if (vcf_block_beg < 0) return false;
+
+            const check_off = @as(i64, n_ref_pad) + vcf_block_beg - @as(i64, tr.beg);
+            if (check_off < 0) return false;
+            if (check_off < @as(i64, @intCast(ex_beg)) - @as(i64, n_ref_pad)) return false;
+
+            const ptr_ref_start: usize = @intCast(check_off);
+
+            var i: usize = 0;
+            while (alt_len_u + i < ref_allele.len) : (i += 1) {
+                if (ptr_ref_start + i >= tscript_ref.len) return false;
+                if (ref_allele[alt_len_u + i] != tscript_ref[ptr_ref_start + i]) return false;
+            }
+        }
+
+        return true;
+    }
+
     /// Deletion consequence at splice site.
     /// Mirrors splice_csq_del() in csq.c.
     fn spliceCsqDel(self: *Splice, ex_beg: u32, ex_end: u32) SpliceResult {
-        // TODO: check for synonymous start (shifted_del_synonymous) — requires
-        // access to the transcript reference sequence.
+        // Check for synonymous start (shifted_del_synonymous): if a deletion near
+        // the start codon can be realigned to preserve the start codon, annotate as
+        // start_retained instead of start_lost.
+        if (self.flags.check_start) {
+            if (self.shiftedDelSynonymous(ex_beg, ex_end)) {
+                self.csq.start_retained = true;
+                return .overlap;
+            }
+        }
 
         // Coordinates that matter: 1bp before deleted base .. last deleted base.
         self.ref_beg = @intCast(self.vcf.pos + self.tbeg - 1);
@@ -703,37 +773,45 @@ pub const Splice = struct {
         const alt = self.vcf.alt_allele;
         const rlen: usize = ref.len;
         const alen: usize = alt.len;
+        const is_symbolic = (alen > 0 and alt[0] == '<');
 
-        // Skip symbolic alleles like <DEL>.
-        if (alen > 0 and alt[0] == '<') {
-            return .var_ref;
+        var rtrim: i32 = undefined;
+        var atrim: i32 = undefined;
+
+        if (is_symbolic) {
+            // Symbolic alleles (<INS:*>, <DEL>): skip trimming, set rtrim=atrim=0
+            // (C: if ( splice->vcf.alt[0]=='<' ) rtrim = atrim = 0;)
+            self.tbeg = 0;
+            self.tend = 0;
+            rtrim = 0;
+            atrim = 0;
+        } else {
+            // Trim common suffix (from right), then common prefix (from left).
+            // This mirrors the C code's trimming loop exactly.
+            var rlen1: i32 = @as(i32, @intCast(rlen)) - 1;
+            var alen1: i32 = @as(i32, @intCast(alen)) - 1;
+            var i: i32 = 0;
+
+            // Trim from right.
+            while (i <= rlen1 and i <= alen1) {
+                if (ref[@intCast(rlen1 - i)] != alt[@intCast(alen1 - i)]) break;
+                i += 1;
+            }
+            self.tend = i;
+            rlen1 -= i;
+            alen1 -= i;
+            i = 0;
+
+            // Trim from left.
+            while (i <= rlen1 and i <= alen1) {
+                if (ref[@intCast(i)] != alt[@intCast(i)]) break;
+                i += 1;
+            }
+            self.tbeg = i;
+
+            rtrim = self.vcf.rlen - self.tbeg - self.tend;
+            atrim = self.vcf.alen - self.tbeg - self.tend;
         }
-
-        // Trim common suffix (from right), then common prefix (from left).
-        // This mirrors the C code's trimming loop exactly.
-        var rlen1: i32 = @as(i32, @intCast(rlen)) - 1;
-        var alen1: i32 = @as(i32, @intCast(alen)) - 1;
-        var i: i32 = 0;
-
-        // Trim from right.
-        while (i <= rlen1 and i <= alen1) {
-            if (ref[@intCast(rlen1 - i)] != alt[@intCast(alen1 - i)]) break;
-            i += 1;
-        }
-        self.tend = i;
-        rlen1 -= i;
-        alen1 -= i;
-        i = 0;
-
-        // Trim from left.
-        while (i <= rlen1 and i <= alen1) {
-            if (ref[@intCast(i)] != alt[@intCast(i)]) break;
-            i += 1;
-        }
-        self.tbeg = i;
-
-        const rtrim = self.vcf.rlen - self.tbeg - self.tend;
-        const atrim = self.vcf.alen - self.tbeg - self.tend;
 
         // Dispatch based on variant type.
         if (self.vcf.rlen == self.vcf.alen) return self.spliceCsqMnp(ex_beg, ex_end);
@@ -917,7 +995,7 @@ test "SNP before exon in intron splice donor region (rev strand)" {
     _ = s.csq; // suppress unused
 }
 
-test "symbolic allele <DEL> -> var_ref" {
+test "symbolic allele <DEL> processes through splice analysis" {
     var tr = makeTestTranscript(.forward);
     defer tr.deinit();
 
@@ -927,7 +1005,9 @@ test "symbolic allele <DEL> -> var_ref" {
     s.reset(150, 1, 1, "A", "<DEL>");
 
     const result = s.spliceCsq(100, 200);
-    try testing.expectEqual(SpliceResult.var_ref, result);
+    // Symbolic alleles now go through splice analysis (matching C behavior).
+    // <DEL> with rlen=1 < alen=5 dispatches to spliceCsqIns which returns .inside
+    try testing.expectEqual(SpliceResult.inside, result);
 }
 
 test "insertion inside exon -> inside result" {

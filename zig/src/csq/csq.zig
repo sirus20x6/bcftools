@@ -1494,16 +1494,18 @@ pub const CsqContext = struct {
 
         // Check for symbolic ALTs
         if (rec.alleles.len >= 2 and rec.alleles[1].len > 0 and rec.alleles[1][0] == '<') {
-            // TODO: test_symbolic_alt
+            try self.testSymbolicAlt(rec);
         } else {
-            // Annotation lookup cascade: CDS -> UTR -> splice -> transcript
+            // Annotation lookup: CDS, UTR, splice are all checked independently;
+            // only tscript (intron/non-coding) is skipped if any of the above hit.
+            // This matches the C code: hit = test_cds(); hit += test_utr(); hit += test_splice();
             var hit: bool = false;
             if (self.local_csq) {
                 hit = try self.testCdsLocal(rec);
             } else {
                 hit = try self.testCds(owned_rec, vbuf);
             }
-            if (!hit) {
+            {
                 const utr_hit = try self.testUtr(rec);
                 hit = hit or utr_hit;
             }
@@ -2277,6 +2279,153 @@ pub const CsqContext = struct {
             }
         }
         return ret;
+    }
+
+    // -----------------------------------------------------------------
+    // testSymbolicAlt — handle <INS:*> and <DEL> symbolic alleles
+    // -----------------------------------------------------------------
+
+    /// Handle symbolic ALT alleles like <INS:ME:ALU> and <DEL>.
+    ///
+    /// Port of test_symbolic_alt() from csq.c (line 3472).
+    /// Checks CDS, UTR, exon (splice), and transcript indices.
+    fn testSymbolicAlt(self: *CsqContext, rec: *const VcfRecord) !void {
+        const gff = self.gff orelse return;
+        const chr = rec.seqname();
+
+        if (rec.alleles.len < 2) return;
+        const alt = rec.alleles[1];
+
+        // Determine elongation or truncation
+        var csq_class: CsqType = 0;
+        if (alt.len >= 4 and std.ascii.eqlIgnoreCase(alt[0..4], "<INS")) {
+            csq_class = CSQ_ELONGATION;
+        } else if (alt.len >= 4 and std.ascii.eqlIgnoreCase(alt[0..4], "<DEL")) {
+            csq_class = CSQ_TRUNCATION;
+        } else return;
+
+        // Symbolic ALTs use pos+1 as the query position (C: beg = rec->pos + 1)
+        const beg = rec.pos + 1;
+        const end = beg;
+
+        var hit = false;
+
+        // Check CDS index
+        {
+            var itr = gff.idx_cds.overlap(chr, beg, end);
+            while (itr.next()) |interval| {
+                const cds: *CdsEntry = interval.payload;
+                const tr: *Transcript = cds.tr;
+                const coding_csq: CsqType = if (tr.biotype.isCoding()) CSQ_CODING_SEQUENCE else CSQ_NON_CODING;
+                var csq = Csq{
+                    .pos = rec.pos,
+                    .vcsq = .{
+                        .csq_type = coding_csq | csq_class,
+                        .biotype = @intFromEnum(tr.biotype),
+                        .strand = if (tr.strand == .forward) .fwd else .rev,
+                        .trid = tr.id,
+                        .vcf_ial = 1,
+                        .gene = if (tr.gene) |g| @as(?[]const u8, if (g.name) |n| std.mem.span(n) else null) else null,
+                    },
+                };
+                try self.csqStage(&csq, rec);
+                hit = true;
+            }
+        }
+
+        // Check UTR index
+        {
+            var itr = gff.idx_utr.overlap(chr, beg, end);
+            while (itr.next()) |interval| {
+                const utr: *Utr = interval.payload;
+                const tr: *Transcript = utr.tr;
+                const utr_csq: CsqType = if (utr.which == .prime5) CSQ_UTR5 else CSQ_UTR3;
+                var csq = Csq{
+                    .pos = rec.pos,
+                    .vcsq = .{
+                        .csq_type = utr_csq | csq_class,
+                        .biotype = @intFromEnum(tr.biotype),
+                        .strand = if (tr.strand == .forward) .fwd else .rev,
+                        .trid = tr.id,
+                        .vcf_ial = 1,
+                        .gene = if (tr.gene) |g| @as(?[]const u8, if (g.name) |n| std.mem.span(n) else null) else null,
+                    },
+                };
+                try self.csqStage(&csq, rec);
+                hit = true;
+            }
+        }
+
+        // Check exon index for splice consequences
+        {
+            var itr = gff.idx_exon.overlap(chr, beg, end);
+            while (itr.next()) |interval| {
+                const exon: *Exon = interval.payload;
+                const tr: *Transcript = exon.tr;
+                if (tr.cds.items.len == 0) continue;
+
+                const check_region_beg = tr.beg != exon.beg;
+                const check_region_end = tr.end != exon.end;
+
+                var splice = Splice.init(self.allocator, tr);
+                defer splice.deinit();
+
+                const ref_allele = rec.alleles[0];
+                splice.reset(
+                    @intCast(rec.pos),
+                    @intCast(ref_allele.len),
+                    1,
+                    ref_allele,
+                    alt,
+                );
+
+                splice.flags.check_donor = true;
+                splice.flags.check_acceptor = true;
+                splice.flags.check_region_beg = check_region_beg;
+                splice.flags.check_region_end = check_region_end;
+                // Pre-set csq to csq_class so splice adds to it (C: splice.csq = csq_class)
+                splice.csq = types.CsqType.fromInt(csq_class);
+
+                _ = splice.spliceCsq(exon.beg, exon.end);
+
+                if (splice.csq.toInt() != 0) {
+                    var csq = Csq{
+                        .pos = rec.pos,
+                        .vcsq = .{
+                            .csq_type = splice.csq.toInt(),
+                            .biotype = @intFromEnum(tr.biotype),
+                            .strand = if (tr.strand == .forward) .fwd else .rev,
+                            .trid = tr.id,
+                            .vcf_ial = 1,
+                            .gene = if (tr.gene) |g| @as(?[]const u8, if (g.name) |n| std.mem.span(n) else null) else null,
+                        },
+                    };
+                    try self.csqStage(&csq, rec);
+                    hit = true;
+                }
+            }
+        }
+
+        // Check transcript index if nothing else hit
+        if (!hit) {
+            var itr = gff.idx_tscript.overlap(chr, beg, end);
+            while (itr.next()) |interval| {
+                const tr: *Transcript = interval.payload;
+                const csq_type: CsqType = if (tr.biotype.isCoding()) CSQ_INTRON else CSQ_NON_CODING;
+                var csq = Csq{
+                    .pos = rec.pos,
+                    .vcsq = .{
+                        .csq_type = csq_type | csq_class,
+                        .biotype = @intFromEnum(tr.biotype),
+                        .strand = if (tr.strand == .forward) .fwd else .rev,
+                        .trid = tr.id,
+                        .vcf_ial = 1,
+                        .gene = if (tr.gene) |g| @as(?[]const u8, if (g.name) |n| std.mem.span(n) else null) else null,
+                    },
+                };
+                try self.csqStage(&csq, rec);
+            }
+        }
     }
 
     // -----------------------------------------------------------------

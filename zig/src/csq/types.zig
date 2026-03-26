@@ -286,6 +286,9 @@ pub const HapNode = struct {
     dlen: i32 = 0,
     /// Variant's VCF position (0-based, inclusive).
     rbeg: u32 = 0,
+    /// Original VCF record position (0-based), used for consequence output.
+    /// May differ from rbeg when the variant is trimmed at exon boundaries.
+    rec_pos: u32 = 0,
     /// Variant's reference length; alt length = rlen + dlen.
     rlen: i32 = 0,
     /// Position on the spliced reference transcript (0-based, exclusive of N_REF_PAD).

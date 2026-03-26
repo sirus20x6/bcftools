@@ -292,8 +292,40 @@ fn writeVcfLine(
         }
     }
 
-    try out.writeAll(line_to_process);
-    try out.writeAll("\n");
+    // Strip trailing semicolons from the INFO field (column 7) to match
+    // bcftools/htslib normalization.  We do this only for the pass-through
+    // (no BCSQ / no FORMAT rewrite) path.
+    {
+        var line = line_to_process;
+        if (line.len > 0 and line[line.len - 1] == '\n') line = line[0 .. line.len - 1];
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+
+        // Find column 7 (INFO) boundaries
+        var tab_count: u32 = 0;
+        var info_start: usize = 0;
+        var info_end: usize = line.len;
+        for (line, 0..) |c, idx| {
+            if (c == '\t') {
+                tab_count += 1;
+                if (tab_count == 7) info_start = idx + 1;
+                if (tab_count == 8) {
+                    info_end = idx;
+                    break;
+                }
+            }
+        }
+        // Strip trailing semicolons from INFO
+        var stripped_end = info_end;
+        while (stripped_end > info_start and line[stripped_end - 1] == ';') stripped_end -= 1;
+        if (stripped_end != info_end) {
+            try out.writeAll(line[0..stripped_end]);
+            try out.writeAll(line[info_end..]);
+            try out.writeAll("\n");
+        } else {
+            try out.writeAll(line);
+            try out.writeAll("\n");
+        }
+    }
 }
 
 /// Drain flushed records from the CSQ context and write them to output.
