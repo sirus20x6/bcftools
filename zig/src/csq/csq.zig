@@ -1323,6 +1323,22 @@ pub const CsqContext = struct {
         for (vrec.vcsqs.items) |*existing| {
             if (isDuplicate(existing, &masked_vcsq)) {
                 existing.csq_type |= t;
+
+                // Remove stop_lost & synonymous if stop_retained set (C line 2059-2060)
+                if (existing.csq_type & CSQ_STOP_RETAINED != 0)
+                    existing.csq_type &= ~(CSQ_STOP_LOST | CSQ_SYNONYMOUS_VARIANT);
+
+                // Remove start_lost & synonymous if start_retained set (C line 2062-2063)
+                if (existing.csq_type & CSQ_START_RETAINED != 0)
+                    existing.csq_type &= ~(CSQ_START_LOST | CSQ_SYNONYMOUS_VARIANT);
+
+                // Copy vstr from new to existing only for compound merges (C line 2065).
+                // Non-compound merges (C line 2082-2085) do NOT copy vstr.
+                if (t & CSQ_COMPOUND != 0) {
+                    if (existing.vstr == null and masked_vcsq.vstr != null) {
+                        existing.vstr = masked_vcsq.vstr;
+                    }
+                }
                 return;
             }
         }
@@ -1634,6 +1650,26 @@ pub const CsqContext = struct {
                         continue;
                     },
                     .added => {},
+                }
+
+                // Stage the splice consequence (mirrors C csq_stage_splice called
+                // from within splice_csq during hap_init).  This creates an early
+                // "placeholder" entry that later gets merged with the compound
+                // consequence from hapFinalize, producing combined annotations
+                // like "start_lost&splice_region".
+                if (child.csq.toInt() != 0) {
+                    var splice_csq = Csq{
+                        .pos = rec.pos,
+                        .vcsq = .{
+                            .csq_type = child.csq.toInt(),
+                            .biotype = @intFromEnum(tr.biotype),
+                            .strand = if (tr.strand == .forward) .fwd else .rev,
+                            .trid = tr.id,
+                            .vcf_ial = 1,
+                            .gene = if (tr.gene) |g| @as(?[]const u8, if (g.name) |n| std.mem.span(n) else null) else null,
+                        },
+                    };
+                    _ = self.csqStage(&splice_csq, rec) catch {};
                 }
 
                 // Splice-only (HAP_SSS): stage the splice consequence directly
@@ -2388,6 +2424,15 @@ pub const CsqContext = struct {
                 // Remove start_lost & synonymous if start_retained set (C line 2062-2063)
                 if (existing.csq_type & CSQ_START_RETAINED != 0)
                     existing.csq_type &= ~(CSQ_START_LOST | CSQ_SYNONYMOUS_VARIANT);
+
+                // Copy vstr from new to existing only for compound merges (C line 2065).
+                // Non-compound merges (C line 2082-2085) do NOT copy vstr.
+                if (t & CSQ_COMPOUND != 0) {
+                    if (existing.vstr == null and csq.vcsq.vstr != null) {
+                        existing.vstr = csq.vcsq.vstr;
+                        csq.vcsq.vstr = null; // transfer ownership
+                    }
+                }
 
                 csq.vrec_idx = vi;
                 csq.csq_idx = idx;

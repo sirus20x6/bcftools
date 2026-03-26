@@ -363,6 +363,10 @@ fn appendCodonRev(
 pub const CsqResult = struct {
     csq_type: CsqType,
     upstream_stop: bool,
+    /// When true, the ibeg node should be treated as SSS (splice-only):
+    /// skip the variant string and OR in the node's splice consequence bits.
+    /// This happens when frameshift+start_lost demotes the node.
+    demote_to_sss: bool = false,
 };
 
 /// Determine the consequence type by comparing translated reference and
@@ -511,9 +515,11 @@ pub fn hapAddCsq(
         }
     }
 
-    // Frameshift + start_lost: demote to splice-only
+    // Frameshift + start_lost: demote to splice-only (HAP_SSS)
+    var demote_to_sss = false;
     if (csq.frameshift_variant and csq.start_lost) {
         rm_csq.frameshift_variant = true;
+        demote_to_sss = true;
     }
 
     if (has_upstream_stop) csq.upstream_stop = true;
@@ -523,6 +529,7 @@ pub fn hapAddCsq(
     return .{
         .csq_type = CsqType.fromInt(csq_raw),
         .upstream_stop = upstream_stop,
+        .demote_to_sss = demote_to_sss,
     };
 }
 
@@ -855,7 +862,28 @@ pub fn hapFinalize(ctx: *HapContext) !void {
                 ctx.sbeg = n1.sbeg;
         }
 
-        std.debug.assert(child_node.payload != .sss);
+        // If the leaf node is SSS-only (splice consequence, no CDS overlap),
+        // handle it separately: no translation/vstr needed, just record the
+        // splice consequence directly.  This mirrors the C code at csq.c:2296.
+        if (child_node.payload == .sss) {
+            // SSS-only leaf: record splice consequence without variant string
+            const csq_entry_sss: types.Csq = .{
+                .pos = child_node.rbeg,
+                .type_info = .{
+                    .csq_type = child_node.csq,
+                    .trid = tr_ptr.id,
+                    .vcf_ial = @intCast(child_node.vcf_ial),
+                    .gene = if (tr_ptr.gene) |g| blk: {
+                        break :blk if (g.name) |n| std.mem.span(n) else null;
+                    } else null,
+                    .strand = tr_ptr.strand == .forward,
+                    .biotype = @intFromEnum(tr_ptr.biotype),
+                },
+            };
+            try child_node.csq_list.append(allocator, csq_entry_sss);
+            istack -= 1;
+            continue;
+        }
         const stack = ctx.stack.items;
 
         if (tr_ptr.strand == .forward) {
@@ -933,6 +961,52 @@ pub fn hapFinalize(ctx: *HapContext) !void {
                 ctx.upstream_stop = csq_result.upstream_stop;
 
                 // Record consequence on the leaf node
+                var merged_csq = csq_result.csq_type;
+
+                // SSS demotion: OR in the ibeg node's own splice bits, skip vstr
+                if (csq_result.demote_to_sss or stack[ibeg_u].node.?.payload == .sss) {
+                    const node_splice_bits = stack[ibeg_u].node.?.csq.toInt();
+                    merged_csq = CsqType.fromInt(merged_csq.toInt() | node_splice_bits);
+                    var csq_entry: types.Csq = .{
+                        .pos = stack[ibeg_u].node.?.rbeg,
+                        .type_info = .{
+                            .csq_type = merged_csq,
+                            .trid = tr_ptr.id,
+                            .vcf_ial = @intCast(child_node.vcf_ial),
+                            .gene = if (tr_ptr.gene) |g| blk: {
+                                break :blk if (g.name) |n| std.mem.span(n) else null;
+                            } else null,
+                            .strand = tr_ptr.strand == .forward,
+                            .biotype = @intFromEnum(tr_ptr.biotype),
+                        },
+                    };
+                    _ = &csq_entry;
+                    try child_node.csq_list.append(allocator, csq_entry);
+
+                    ibeg_s = -1;
+                    dlen_acc = 0;
+                    indel_flag = false;
+                    continue;
+                }
+
+                // Truncate tref/tseq at first stop codon for buildVstr (C lines 2203-2221).
+                // hapAddCsq already determined consequences using its own truncation;
+                // this truncation ensures buildVstr uses the short AA strings.
+                for (ctx.tref_stop.items, 0..) |ch, tidx| {
+                    if (ch == '*') {
+                        ctx.tref.shrinkRetainingCapacity(tidx + 1);
+                        ctx.tref_stop.shrinkRetainingCapacity(tidx + 1);
+                        break;
+                    }
+                }
+                for (ctx.tseq_stop.items, 0..) |ch, tidx| {
+                    if (ch == '*') {
+                        ctx.tseq.shrinkRetainingCapacity(tidx + 1);
+                        ctx.tseq_stop.shrinkRetainingCapacity(tidx + 1);
+                        break;
+                    }
+                }
+
                 var csq_entry: types.Csq = .{
                     .pos = stack[if (tr_ptr.strand == .forward) ibeg_u else i].node.?.rbeg,
                     .type_info = .{
@@ -1059,6 +1133,50 @@ pub fn hapFinalize(ctx: *HapContext) !void {
                 ctx.upstream_stop = csq_result.upstream_stop;
 
                 // Record consequence on the leaf node
+                var merged_csq_rev = csq_result.csq_type;
+
+                // SSS demotion (reverse strand): ibeg for reverse is 'i'
+                if (csq_result.demote_to_sss or stack[i].node.?.payload == .sss) {
+                    const node_splice_bits = stack[i].node.?.csq.toInt();
+                    merged_csq_rev = CsqType.fromInt(merged_csq_rev.toInt() | node_splice_bits);
+                    var csq_entry_sss: types.Csq = .{
+                        .pos = stack[i].node.?.rbeg,
+                        .type_info = .{
+                            .csq_type = merged_csq_rev,
+                            .trid = tr_ptr.id,
+                            .vcf_ial = @intCast(child_node.vcf_ial),
+                            .gene = if (tr_ptr.gene) |g| blk: {
+                                break :blk if (g.name) |n| std.mem.span(n) else null;
+                            } else null,
+                            .strand = tr_ptr.strand == .forward,
+                            .biotype = @intFromEnum(tr_ptr.biotype),
+                        },
+                    };
+                    _ = &csq_entry_sss;
+                    try child_node.csq_list.append(allocator, csq_entry_sss);
+
+                    ibeg_s = -1;
+                    dlen_acc = 0;
+                    indel_flag = false;
+                    continue;
+                }
+
+                // Truncate tref/tseq at first stop for buildVstr (C lines 2203-2221)
+                for (ctx.tref_stop.items, 0..) |ch, tidx| {
+                    if (ch == '*') {
+                        ctx.tref.shrinkRetainingCapacity(tidx + 1);
+                        ctx.tref_stop.shrinkRetainingCapacity(tidx + 1);
+                        break;
+                    }
+                }
+                for (ctx.tseq_stop.items, 0..) |ch, tidx| {
+                    if (ch == '*') {
+                        ctx.tseq.shrinkRetainingCapacity(tidx + 1);
+                        ctx.tseq_stop.shrinkRetainingCapacity(tidx + 1);
+                        break;
+                    }
+                }
+
                 var csq_entry: types.Csq = .{
                     .pos = stack[ibeg_u].node.?.rbeg,
                     .type_info = .{

@@ -61,7 +61,8 @@ pub const Strand = enum(u1) {
 };
 
 /// GFF feature biotype constants for NMD detection.
-pub const GF_NMD: u32 = 0x1000; // placeholder; must match gff/types.zig once it exists
+/// Must match @intFromEnum(gff_types.Biotype.NMD) = 12 | (1 << 6) = 76.
+pub const GF_NMD: u32 = 76;
 
 /// Consequence string table, indexed by bit position.
 /// Matches csq_strings[] from csq.c.
