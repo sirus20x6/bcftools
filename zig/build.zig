@@ -50,6 +50,23 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // Benchmark executable — always compiled with ReleaseFast
+    const bench = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "bcftools_zig", .module = lib_mod },
+            },
+        }),
+    });
+    b.installArtifact(bench);
+    const bench_step = b.step("bench", "Run micro-benchmarks");
+    const run_bench = b.addRunArtifact(bench);
+    bench_step.dependOn(&run_bench.step);
+
     // Integration tests
     const integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
