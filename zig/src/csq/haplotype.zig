@@ -26,13 +26,22 @@ const n_ref_pad = types.n_ref_pad;
 // HapInitResult — return value from hapInit
 // ---------------------------------------------------------------------------
 
-pub const HapInitResult = enum {
+pub const HapInitResultKind = enum {
     /// Variant was added to the haplotype tree.
     added,
     /// Variant overlaps a previous variant on this haplotype.
     overlapping,
     /// Variant was silently discarded (intronic, alt=ref, etc.).
     discarded,
+};
+
+pub const HapInitResult = struct {
+    kind: HapInitResultKind,
+    /// The full splice consequence from splice_csq, BEFORE synonymous is cleared
+    /// for the CDS path.  In the C code, splice_csq_del stages this via
+    /// csq_stage_splice before returning SPLICE_INSIDE, so the caller needs the
+    /// pre-clearing value for its own staging.
+    splice_csq: CsqType = .{},
 };
 
 // ---------------------------------------------------------------------------
@@ -644,10 +653,10 @@ pub fn hapInit(
 
     // ── Step 2: handle non-coding results ──────────────────────────
 
-    if (ret == .var_ref) return .discarded; // not a variant
+    if (ret == .var_ref) return .{ .kind = .discarded }; // not a variant
 
     if (ret == .outside or ret == .overlap) {
-        if (splice.csq.toInt() == 0) return .discarded; // fully intronic
+        if (splice.csq.toInt() == 0) return .{ .kind = .discarded }; // fully intronic
 
         // Splice region/acceptor/donor: create HAP_SSS node
         child.payload = .{ .sss = {} };
@@ -665,8 +674,13 @@ pub fn hapInit(
         child.var_str = var_str;
 
         child.csq = splice.csq;
-        return .added;
+        return .{ .kind = .added, .splice_csq = splice.csq };
     }
+
+    // Save the full splice CSQ before clearing synonymous.
+    // In the C code, splice_csq_del stages this via csq_stage_splice before
+    // returning SPLICE_INSIDE, so the caller needs the pre-clearing value.
+    const full_splice_csq = splice.csq;
 
     // Clear synonymous if set by splice (will be re-evaluated after translation)
     if (splice.csq.synonymous_variant)
@@ -686,7 +700,7 @@ pub fn hapInit(
 
     var seq_buf: ArrayList(u8) = .empty;
 
-    const ref_seq = tscript_aux.ref_seq orelse return .discarded;
+    const ref_seq = tscript_aux.ref_seq orelse return .{ .kind = .discarded };
 
     if (parent.payload == .cds) {
         const parent_icds = parent.icds;
@@ -719,7 +733,7 @@ pub fn hapInit(
             if (splice.ref_beg < parent_var_end) {
                 // Overlapping variants
                 seq_buf.deinit(allocator);
-                return .overlapping;
+                return .{ .kind = .overlapping };
             }
             const gap = splice.ref_beg - parent_var_end;
             if (gap > 0) {
@@ -748,7 +762,9 @@ pub fn hapInit(
     child.sbeg = cds.pos + (splice.ref_beg - cds.beg);
     child.rbeg = splice.ref_beg;
     child.rec_pos = rec_pos; // original VCF position for consequence output
-    child.rlen = @intCast(splice.kref.items.len);
+    // C: splice.kref.l -= dbeg; child->rlen = splice.kref.l;
+    // Subtract dbeg from kref length when variant overlaps exon boundary
+    child.rlen = @intCast(splice.kref.items.len -| dbeg);
     child.prev = parent;
     child.csq = splice.csq;
 
@@ -766,7 +782,7 @@ pub fn hapInit(
         if (child.csq.toInt() == 0) child.csq.coding_sequence = true;
     }
 
-    return .added;
+    return .{ .kind = .added, .splice_csq = full_splice_csq };
 }
 
 // ---------------------------------------------------------------------------
@@ -1829,7 +1845,7 @@ test "hapInit returns discarded for ref==alt" {
         &tscript_data,
     );
 
-    try std.testing.expectEqual(HapInitResult.discarded, result);
+    try std.testing.expectEqual(HapInitResultKind.discarded, result.kind);
 }
 
 test "hapInit creates CDS node for coding SNP" {
@@ -1882,7 +1898,7 @@ test "hapInit creates CDS node for coding SNP" {
         &tscript_data,
     );
 
-    try std.testing.expectEqual(HapInitResult.added, result);
+    try std.testing.expectEqual(HapInitResultKind.added, result.kind);
     try std.testing.expect(child.payload == .cds);
     try std.testing.expectEqual(@as(i32, 0), child.dlen); // SNP: no length change
     try std.testing.expect(child.var_str != null);

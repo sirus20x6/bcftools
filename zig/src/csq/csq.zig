@@ -1671,7 +1671,7 @@ pub const CsqContext = struct {
                     continue;
                 };
 
-                switch (hap_ret) {
+                switch (hap_ret.kind) {
                     .overlapping => {
                         child.deinit(self.allocator);
                         self.allocator.destroy(child);
@@ -1691,11 +1691,14 @@ pub const CsqContext = struct {
                 // "placeholder" entry that later gets merged with the compound
                 // consequence from hapFinalize, producing combined annotations
                 // like "start_lost&splice_region".
-                if (child.csq.toInt() != 0) {
+                // Use the pre-clearing splice_csq from hapInit which preserves
+                // synonymous_variant (C stages this via csq_stage_splice before
+                // clearing synonymous for the CDS path).
+                if (hap_ret.splice_csq.toInt() != 0) {
                     var splice_csq = Csq{
                         .pos = rec.pos,
                         .vcsq = .{
-                            .csq_type = child.csq.toInt(),
+                            .csq_type = hap_ret.splice_csq.toInt(),
                             .biotype = @intFromEnum(tr.biotype),
                             .strand = if (tr.strand == .forward) .fwd else .rev,
                             .trid = tr.id,
@@ -1853,7 +1856,7 @@ pub const CsqContext = struct {
                         continue;
                     };
 
-                    switch (hap_ret) {
+                    switch (hap_ret.kind) {
                         .overlapping => {
                             child.deinit(self.allocator);
                             self.allocator.destroy(child);
@@ -1865,6 +1868,22 @@ pub const CsqContext = struct {
                             continue;
                         },
                         .added => {},
+                    }
+
+                    // Stage the pre-clearing splice consequence (mirrors C csq_stage_splice)
+                    if (hap_ret.splice_csq.toInt() != 0) {
+                        var splice_csq_entry = Csq{
+                            .pos = rec.pos,
+                            .vcsq = .{
+                                .csq_type = hap_ret.splice_csq.toInt(),
+                                .biotype = @intFromEnum(tr.biotype),
+                                .strand = if (tr.strand == .forward) .fwd else .rev,
+                                .trid = tr.id,
+                                .vcf_ial = ial,
+                                .gene = if (tr.gene) |g| @as(?[]const u8, if (g.name) |n| std.mem.span(n) else null) else null,
+                            },
+                        };
+                        _ = self.csqStage(&splice_csq_entry, rec) catch {};
                     }
 
                     // Splice-only (HAP_SSS): stage the splice consequence directly
@@ -1994,7 +2013,7 @@ pub const CsqContext = struct {
                     taux,
                 ) catch continue;
 
-                if (hap_ret != .added) continue;
+                if (hap_ret.kind != .added) continue;
                 defer {
                     if (node.payload == .cds) {
                         if (node.payload.cds.seq) |seq| self.allocator.free(seq);
