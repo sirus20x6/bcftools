@@ -44,6 +44,10 @@ pub const Splice = struct {
 
     flags: Flags = .{},
 
+    /// Optional transcript reference sequence (padded with n_ref_pad on each side).
+    /// When set, buildHap can construct haplotypes for synonymous-variant detection.
+    tr_ref: ?[]const u8 = null,
+
     csq: types.CsqType = .{},
     tbeg: i32 = 0,
     tend: i32 = 0,
@@ -99,19 +103,170 @@ pub const Splice = struct {
     // -----------------------------------------------------------------------
     // splice_build_hap — construct ref/alt haplotype around splice site
     //
-    // This requires access to the transcript's cached reference sequence
-    // (TSCRIPT_AUX(tr)->ref), which is not yet available in the Zig port.
-    // The boundary-checking logic works without it; haplotype reconstruction
-    // is only needed for synonymous-variant detection.
+    // Builds kref (reference haplotype) and kalt (alt haplotype) by stitching
+    // together bases from the transcript reference and the VCF alleles. This
+    // is used to check whether a splice-site variant is synonymous (ref seq
+    // == alt seq at the splice site).
     // -----------------------------------------------------------------------
 
-    // TODO: implement splice_build_hap
-    // The C version builds ref/alt kstrings by stitching together:
-    //   1. bases from the transcript reference before the VCF allele
-    //   2. the VCF ref or alt allele itself
-    //   3. bases from the transcript reference after the VCF allele
-    // This is used to check whether a splice-site variant is synonymous
-    // (ref seq == alt seq at the splice site).
+    /// Build reference and alt haplotype sequences around a splice site.
+    ///
+    /// `beg`: start/end position of the splice region (0-based genomic coordinate).
+    /// `len`: positive = beg is the first base, fill rightward;
+    ///        negative = beg is the last base, fill leftward.
+    /// `ref_seq`: the transcript reference sequence, padded with `n_ref_pad` on each side.
+    /// `tr_beg`: transcript begin position (0-based genomic coordinate).
+    pub fn buildHap(self: *Splice, beg: u32, len: i32, ref_seq: []const u8, tr_beg: u32) void {
+        var rbeg: i64 = undefined;
+        var abeg: i64 = undefined;
+        var rlen_val: i64 = undefined;
+        var alen_val: i64 = undefined;
+
+        if (len < 0) {
+            // Fill from left: beg is the last base
+            rlen_val = -@as(i64, len);
+            alen_val = rlen_val;
+            rbeg = @as(i64, @intCast(beg)) - rlen_val + 1;
+            const dlen: i64 = @as(i64, self.vcf.alen) - @as(i64, self.vcf.rlen);
+            var adj_dlen = dlen;
+            if (dlen < 0 and @as(i64, @intCast(beg)) < @as(i64, @intCast(self.ref_end))) {
+                adj_dlen += @as(i64, @intCast(self.ref_end)) - @as(i64, @intCast(beg));
+            }
+            abeg = rbeg + adj_dlen;
+        } else {
+            if (beg < tr_beg) {
+                // Very short exons/introns edge case — don't crash.
+                rbeg = @intCast(tr_beg);
+                abeg = @intCast(tr_beg);
+                rlen_val = 0;
+                alen_val = 0;
+            } else {
+                rbeg = @intCast(beg);
+                abeg = @intCast(beg);
+                rlen_val = @intCast(len);
+                alen_val = @intCast(len);
+            }
+        }
+
+        self.kref.clearRetainingCapacity();
+        self.kalt.clearRetainingCapacity();
+
+        // ----- Build kref: [before vcf.ref] + [vcf.ref portion] + [after vcf.ref] -----
+        const vcf_pos: i64 = @intCast(self.vcf.pos);
+        const tr_beg_i: i64 = @intCast(tr_beg);
+
+        var roff: i64 = undefined;
+        if (rbeg < vcf_pos) {
+            // Add bases from transcript ref before the VCF position
+            const start: usize = @intCast(@as(i64, n_ref_pad) + rbeg - tr_beg_i);
+            const count: usize = @intCast(vcf_pos - rbeg);
+            if (start + count <= ref_seq.len) {
+                self.kref.appendSlice(self.allocator, ref_seq[start .. start + count]) catch {};
+            }
+            roff = 0;
+        } else {
+            roff = rbeg - vcf_pos;
+        }
+
+        // Add the matching portion of VCF ref allele
+        if (roff < @as(i64, self.vcf.rlen) and @as(i64, @intCast(self.kref.items.len)) < rlen_val) {
+            var avail: i64 = @as(i64, self.vcf.rlen) - roff;
+            const needed: i64 = rlen_val - @as(i64, @intCast(self.kref.items.len));
+            if (avail > needed) avail = needed;
+            if (avail > 0) {
+                const off_u: usize = @intCast(roff);
+                const avail_u: usize = @intCast(avail);
+                if (off_u + avail_u <= self.vcf.ref_allele.len) {
+                    self.kref.appendSlice(self.allocator, self.vcf.ref_allele[off_u .. off_u + avail_u]) catch {};
+                }
+            }
+        }
+
+        // Add bases from transcript ref after the VCF ref allele
+        const ref_allele_end: i64 = vcf_pos + @as(i64, self.vcf.rlen); // position just after ref allele
+        if (@as(i64, @intCast(self.kref.items.len)) < rlen_val) {
+            var rlen_adj = rlen_val;
+            const tr_end_i: i64 = @intCast(self.tr.end);
+            if (ref_allele_end + rlen_adj - @as(i64, @intCast(self.kref.items.len)) - 1 > tr_end_i) {
+                rlen_adj -= ref_allele_end + rlen_adj - @as(i64, @intCast(self.kref.items.len)) - 1 - tr_end_i;
+            }
+            if (@as(i64, @intCast(self.kref.items.len)) < rlen_adj) {
+                const start: usize = @intCast(@as(i64, n_ref_pad) + ref_allele_end - tr_beg_i);
+                const count: usize = @intCast(rlen_adj - @as(i64, @intCast(self.kref.items.len)));
+                if (start + count <= ref_seq.len) {
+                    self.kref.appendSlice(self.allocator, ref_seq[start .. start + count]) catch {};
+                }
+            }
+        }
+
+        // ----- Build kalt: [before vcf.ref] + [vcf.alt portion] + [after vcf.ref] -----
+        var aoff: i64 = undefined;
+        if (abeg < vcf_pos) {
+            // Add bases from transcript ref before the VCF position
+            const start: usize = @intCast(@as(i64, n_ref_pad) + abeg - tr_beg_i);
+            const count: usize = @intCast(vcf_pos - abeg);
+            if (start + count <= ref_seq.len) {
+                self.kalt.appendSlice(self.allocator, ref_seq[start .. start + count]) catch {};
+            }
+            aoff = 0;
+        } else {
+            aoff = abeg - vcf_pos;
+        }
+
+        // Add the matching portion of VCF alt allele
+        if (aoff < @as(i64, self.vcf.alen) and @as(i64, @intCast(self.kalt.items.len)) < alen_val) {
+            var avail: i64 = @as(i64, self.vcf.alen) - aoff;
+            const needed: i64 = alen_val - @as(i64, @intCast(self.kalt.items.len));
+            if (avail > needed) avail = needed;
+            if (avail > 0) {
+                const off_u: usize = @intCast(aoff);
+                const avail_u: usize = @intCast(avail);
+                if (off_u + avail_u <= self.vcf.alt_allele.len) {
+                    self.kalt.appendSlice(self.allocator, self.vcf.alt_allele[off_u .. off_u + avail_u]) catch {};
+                }
+            }
+            aoff -= avail;
+        }
+        if (aoff < 0) {
+            aoff = 0;
+        } else {
+            aoff -= 1;
+        }
+
+        // Add bases from transcript ref after the VCF ref allele
+        if (@as(i64, @intCast(self.kalt.items.len)) < alen_val) {
+            var alen_adj = alen_val;
+            const tr_end_i: i64 = @intCast(self.tr.end);
+            if (ref_allele_end + alen_adj + aoff - @as(i64, @intCast(self.kalt.items.len)) - 1 > tr_end_i) {
+                alen_adj -= ref_allele_end + alen_adj + aoff - @as(i64, @intCast(self.kalt.items.len)) - 1 - tr_end_i;
+            }
+            if (alen_adj > 0 and alen_adj > @as(i64, @intCast(self.kalt.items.len))) {
+                const start_i: i64 = aoff + @as(i64, n_ref_pad) + ref_allele_end - tr_beg_i;
+                const count: i64 = alen_adj - @as(i64, @intCast(self.kalt.items.len));
+                if (start_i >= 0 and count > 0) {
+                    const start: usize = @intCast(start_i);
+                    const count_u: usize = @intCast(count);
+                    if (start + count_u <= ref_seq.len) {
+                        self.kalt.appendSlice(self.allocator, ref_seq[start .. start + count_u]) catch {};
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check whether the ref and alt haplotypes around a splice site are identical
+    /// over the first `check_len` bases. Returns true if they are synonymous.
+    fn spliceCheckRefAlt(self: *const Splice, check_len: usize) bool {
+        if (self.kref.items.len < check_len or self.kalt.items.len < check_len) return false;
+        return std.mem.eql(u8, self.kref.items[0..check_len], self.kalt.items[0..check_len]);
+    }
+
+    /// Check whether the ref and alt haplotypes are identical over `check_len` bases
+    /// starting at offset `off`. Returns true if they are synonymous in that region.
+    fn spliceCheckRefAltOff(self: *const Splice, off: usize, check_len: usize) bool {
+        if (self.kref.items.len < off + check_len or self.kalt.items.len < off + check_len) return false;
+        return std.mem.eql(u8, self.kref.items[off .. off + check_len], self.kalt.items[off .. off + check_len]);
+    }
 
     // -----------------------------------------------------------------------
     // Boundary helpers (intronic side of splice site)
@@ -266,7 +421,27 @@ pub const Splice = struct {
         if (self.ref_beg >= ex_end) {
             // TODO: check UTR overlap (requires region index)
             if (!self.flags.check_region_end) return .outside;
-            self.checkIntronEnd(ex_end);
+
+            if (self.flags.set_refalt) {
+                if (self.tr_ref) |ref_seq| {
+                    self.buildHap(ex_end + 1, @intCast(n_splice_region_intron), ref_seq, self.tr.beg);
+                }
+            }
+            const have_hap = self.kref.items.len > 0;
+
+            if (self.ref_beg < ex_end + n_splice_region_intron and self.ref_end > ex_end + n_splice_donor) {
+                self.csq.splice_region = true;
+                if (have_hap and self.spliceCheckRefAlt(n_splice_region_intron))
+                    self.csq.synonymous_variant = true;
+            }
+            if (self.ref_beg < ex_end + n_splice_donor) {
+                if (self.flags.check_donor and self.tr.strand == .forward)
+                    self.csq.splice_donor = true;
+                if (self.flags.check_acceptor and self.tr.strand == .reverse)
+                    self.csq.splice_acceptor = true;
+                if (have_hap and self.spliceCheckRefAlt(n_splice_donor))
+                    self.csq.synonymous_variant = true;
+            }
             return .outside;
         }
 
@@ -274,7 +449,28 @@ pub const Splice = struct {
         if (self.ref_end < ex_beg or (self.ref_end == ex_beg and !self.flags.check_region_beg)) {
             // TODO: check UTR overlap (requires region index)
             if (!self.flags.check_region_beg) return .outside;
-            self.checkIntronBeg(ex_beg);
+
+            if (self.flags.set_refalt) {
+                if (self.tr_ref) |ref_seq| {
+                    self.buildHap(ex_beg - n_splice_region_intron, @intCast(n_splice_region_intron), ref_seq, self.tr.beg);
+                }
+            }
+            const have_hap = self.kref.items.len > 0;
+
+            if (self.ref_end > ex_beg - n_splice_region_intron and self.ref_beg < ex_beg - n_splice_donor) {
+                self.csq.splice_region = true;
+                if (have_hap and self.spliceCheckRefAlt(n_splice_region_intron))
+                    self.csq.synonymous_variant = true;
+            }
+            if (self.ref_end > ex_beg - n_splice_donor) {
+                if (self.flags.check_donor and self.tr.strand == .reverse)
+                    self.csq.splice_donor = true;
+                if (self.flags.check_acceptor and self.tr.strand == .forward)
+                    self.csq.splice_acceptor = true;
+                const noff: usize = n_splice_region_intron - n_splice_donor;
+                if (have_hap and self.spliceCheckRefAltOff(noff, n_splice_donor))
+                    self.csq.synonymous_variant = true;
+            }
             return .outside;
         }
 
@@ -299,8 +495,25 @@ pub const Splice = struct {
         }
 
         if (self.flags.set_refalt) {
-            // TODO: implement splice_build_hap for insertion refalt construction
-            _ = {};
+            if (self.tr_ref) |ref_seq| {
+                // Adjust for left-alignment avoidance (mirrors C code)
+                if (self.ref_beg < @as(u32, @intCast(self.vcf.pos))) {
+                    const dlen_adj: i32 = self.vcf.pos - @as(i32, @intCast(self.ref_beg));
+                    self.tbeg += dlen_adj;
+                    if (self.tbeg + self.tend == self.vcf.rlen) self.tend -= dlen_adj;
+                    self.ref_beg = @intCast(self.vcf.pos);
+                }
+                if (self.ref_end == ex_beg) self.tend -= 1; // prevent zero-length ref allele
+                const hap_len = self.vcf.alen - self.tend - self.tbeg + 1;
+                if (hap_len > 0) {
+                    self.buildHap(self.ref_beg, hap_len, ref_seq, self.tr.beg);
+                }
+                self.vcf.rlen -= self.tbeg + self.tend - 1;
+                const rlen_u: usize = @intCast(@max(0, self.vcf.rlen));
+                if (self.kref.items.len > rlen_u) {
+                    self.kref.shrinkRetainingCapacity(rlen_u);
+                }
+            }
         }
 
         return .inside;
@@ -320,7 +533,27 @@ pub const Splice = struct {
         if (self.ref_beg + 1 < ex_beg) {
             if (self.flags.check_region_beg) {
                 // TODO: check UTR overlap (requires region index)
-                self.checkIntronBeg(ex_beg);
+                if (self.flags.set_refalt) {
+                    if (self.tr_ref) |ref_seq| {
+                        self.buildHap(ex_beg - n_splice_region_intron, @intCast(n_splice_region_intron), ref_seq, self.tr.beg);
+                    }
+                }
+                const have_hap = self.kref.items.len > 0;
+
+                if (self.ref_end >= ex_beg - n_splice_region_intron and self.ref_beg < ex_beg - n_splice_donor) {
+                    self.csq.splice_region = true;
+                    if (have_hap and self.spliceCheckRefAlt(n_splice_region_intron))
+                        self.csq.synonymous_variant = true;
+                }
+                if (self.ref_end >= ex_beg - n_splice_donor) {
+                    if (self.flags.check_donor and self.tr.strand == .reverse)
+                        self.csq.splice_donor = true;
+                    if (self.flags.check_acceptor and self.tr.strand == .forward)
+                        self.csq.splice_acceptor = true;
+                    const noff: usize = n_splice_region_intron - n_splice_donor;
+                    if (have_hap and self.spliceCheckRefAltOff(noff, n_splice_donor))
+                        self.csq.synonymous_variant = true;
+                }
             }
             if (self.ref_end >= ex_beg) {
                 // Deletion spans from intron into exon — adjust.
@@ -340,7 +573,27 @@ pub const Splice = struct {
         if (ex_end < self.ref_end) {
             if (self.flags.check_region_end) {
                 // TODO: check UTR overlap (requires region index)
-                self.checkIntronEnd(ex_end);
+                if (self.flags.set_refalt) {
+                    if (self.tr_ref) |ref_seq| {
+                        self.buildHap(ex_end + 1, @intCast(n_splice_region_intron), ref_seq, self.tr.beg);
+                    }
+                }
+                const have_hap = self.kref.items.len > 0;
+
+                if (self.ref_beg < ex_end + n_splice_region_intron and self.ref_end > ex_end + n_splice_donor) {
+                    self.csq.splice_region = true;
+                    if (have_hap and self.spliceCheckRefAlt(n_splice_region_intron))
+                        self.csq.synonymous_variant = true;
+                }
+                if (self.ref_beg < ex_end + n_splice_donor) {
+                    if (self.flags.check_donor and self.tr.strand == .forward)
+                        self.csq.splice_donor = true;
+                    if (self.flags.check_acceptor and self.tr.strand == .reverse)
+                        self.csq.splice_acceptor = true;
+                    const noff: usize = n_splice_region_intron - n_splice_donor;
+                    if (have_hap and self.spliceCheckRefAltOff(noff, n_splice_donor))
+                        self.csq.synonymous_variant = true;
+                }
             }
             if (self.ref_beg < ex_end) {
                 self.tend = @intCast(self.vcf.rlen - @as(i32, @intCast(self.ref_end - @as(u32, @intCast(self.vcf.pos)) + 1)));
@@ -373,8 +626,8 @@ pub const Splice = struct {
         }
 
         if (self.flags.set_refalt) {
-            // TODO: implement splice_build_hap for deletion refalt construction
-            _ = {};
+            // For deletions inside the exon, no splice_build_hap call in C code —
+            // the MNP-style trimming is used instead (handled by the caller).
         }
 
         return .inside;
@@ -667,4 +920,191 @@ test "deletion inside exon -> inside result" {
     const result = s.spliceCsq(100, 200);
 
     try testing.expectEqual(SpliceResult.inside, result);
+}
+
+fn makeTestTranscriptAt(strand: gff_types.Strand, beg: u32, end: u32) gff_types.Transcript {
+    var tr = gff_types.Transcript.init(testing.allocator);
+    tr.strand = strand;
+    tr.beg = beg;
+    tr.end = end;
+    return tr;
+}
+
+test "buildHap: SNP at splice donor site constructs correct ref/alt haplotypes" {
+    // Simulate a transcript starting at position 100 with an exon [100, 107].
+    // Transcript reference (with n_ref_pad=10 padding on each side):
+    //   positions: 90..117 (0-based)
+    //   ref_seq index 0 = position 90
+    //   ref_seq index 10 = position 100 (tr_beg)
+    //
+    // The CDS is ATGCCCAG at positions 100-107, with intron starting at 108.
+    // Padding: 10 N's on each side.
+    const ref_seq = "NNNNNNNNNNATGCCCAGNNNNNNNNNN";
+    //                0123456789012345678901234567
+    //                          ^ pos 100 (tr_beg)
+    //                                  ^ pos 108 (first intron base)
+    const tr_beg: u32 = 100;
+    const tr_end: u32 = 117;
+
+    var tr = makeTestTranscriptAt(.forward, tr_beg, tr_end);
+    defer tr.deinit();
+
+    var s = Splice.init(testing.allocator, &tr);
+    defer s.deinit();
+
+    // SNP at position 108 (first intron base after exon end 107): G>T
+    // This is a splice donor variant.
+    s.reset(108, 1, 1, "N", "T");
+    s.vcf.alen = 1;
+
+    // ref_beg=108, ref_end=108
+    s.ref_beg = 108;
+    s.ref_end = 108;
+
+    // Build haplotype starting at first intron base (ex_end+1=108),
+    // length = n_splice_region_intron (8 bases).
+    s.buildHap(108, @intCast(n_splice_region_intron), ref_seq, tr_beg);
+
+    // kref should be 8 bases from ref_seq starting at position 108
+    // ref_seq index for pos 108 = 10 + (108 - 100) = 18
+    // ref_seq[18..26] = "NNNNNNNN" (these are the intron N padding)
+    try testing.expectEqual(@as(usize, 8), s.kref.items.len);
+    try testing.expectEqualStrings("NNNNNNNN", s.kref.items);
+
+    // kalt: the first base is replaced by the alt allele 'T', rest from ref
+    // aoff=0 (abeg==vcf_pos), takes 1 base from alt ('T'), then 7 from ref
+    try testing.expectEqual(@as(usize, 8), s.kalt.items.len);
+    try testing.expectEqualStrings("TNNNNNNN", s.kalt.items);
+
+    // The haplotypes differ, so this is NOT synonymous at the donor site
+    try testing.expect(!s.spliceCheckRefAlt(n_splice_donor));
+}
+
+test "buildHap: synonymous SNP at splice region does not alter donor bases" {
+    // Same setup but SNP is at position 112 (5 bases into intron),
+    // beyond the 2bp donor window but within the 8bp region.
+    const ref_seq = "NNNNNNNNNNATGCCCAGGTACNNNNNNN";
+    //                0123456789012345678901234567
+    //                          ^ pos 100 (tr_beg)
+    //                                  ^ pos 108 (first intron base)
+    //                                      ^ pos 112 (SNP here)
+    const tr_beg: u32 = 100;
+    const tr_end: u32 = 117;
+
+    var tr = makeTestTranscriptAt(.forward, tr_beg, tr_end);
+    defer tr.deinit();
+
+    var s = Splice.init(testing.allocator, &tr);
+    defer s.deinit();
+
+    // SNP at position 112: A>T (in the splice region but not donor)
+    s.reset(112, 1, 1, "A", "T");
+    s.vcf.alen = 1;
+    s.ref_beg = 112;
+    s.ref_end = 112;
+
+    // Build from ex_end+1=108, length=8
+    s.buildHap(108, 8, ref_seq, tr_beg);
+
+    // kref: 4 bases from ref_seq before VCF pos (GTAC) + 1 VCF ref base (A) + 3 from ref_seq after
+    try testing.expectEqual(@as(usize, 8), s.kref.items.len);
+    try testing.expectEqualStrings("GTACANNN", s.kref.items);
+
+    // kalt: 4 bases from ref_seq before VCF pos (GTAC) + 1 alt base (T) + 3 from ref_seq after
+    try testing.expectEqual(@as(usize, 8), s.kalt.items.len);
+    try testing.expectEqualStrings("GTACTNNN", s.kalt.items);
+
+    // The first 2 bases (donor site) are the same: GT == GT
+    try testing.expect(s.spliceCheckRefAlt(n_splice_donor));
+
+    // But the full 8 bases differ
+    try testing.expect(!s.spliceCheckRefAlt(n_splice_region_intron));
+}
+
+test "buildHap: negative len fills from the left" {
+    // Test the negative-len path (beg is the last base, fill leftward).
+    const ref_seq = "NNNNNNNNNNATGCCCAGGTACNNNNNNN";
+    const tr_beg: u32 = 100;
+    const tr_end: u32 = 117;
+
+    var tr = makeTestTranscriptAt(.forward, tr_beg, tr_end);
+    defer tr.deinit();
+
+    var s = Splice.init(testing.allocator, &tr);
+    defer s.deinit();
+
+    // SNP at position 99 (just before exon): N>T
+    s.reset(99, 1, 1, "N", "T");
+    s.vcf.alen = 1;
+    s.ref_beg = 99;
+    s.ref_end = 99;
+
+    // Fill from left: beg=99 is the last base, len=-4 means we want 4 bases ending at 99.
+    // rbeg = 99 - 4 + 1 = 96
+    // Positions 96-99 from ref_seq: index 10 + (96-100) = 6..10 = "NNNN"
+    s.buildHap(99, -4, ref_seq, tr_beg);
+
+    try testing.expectEqual(@as(usize, 4), s.kref.items.len);
+    try testing.expectEqualStrings("NNNN", s.kref.items);
+
+    // kalt: abeg = rbeg + dlen = 96 + (1-1) = 96 (same as rbeg for SNP)
+    // Same structure, but base at 99 replaced with T
+    try testing.expectEqual(@as(usize, 4), s.kalt.items.len);
+    try testing.expectEqualStrings("NNNT", s.kalt.items);
+}
+
+test "buildHap via spliceCsqIns: insertion in intron with ref available" {
+    // Insertion at splice donor site with transcript reference available.
+    // Exon [100, 107], insertion G>GT at position 108 (first intron base).
+    const ref_seq = "NNNNNNNNNNATGCCCAGGTACNNNNNNN";
+    const tr_beg: u32 = 100;
+
+    var tr = makeTestTranscriptAt(.forward, tr_beg, 117);
+    defer tr.deinit();
+
+    var s = Splice.init(testing.allocator, &tr);
+    defer s.deinit();
+
+    s.reset(108, 1, 1, "G", "GT");
+    s.flags.check_donor = true;
+    s.flags.check_region_end = true;
+    s.flags.set_refalt = true;
+    s.tr_ref = ref_seq;
+
+    const result = s.spliceCsq(100, 107);
+
+    try testing.expectEqual(SpliceResult.outside, result);
+    // Splice donor should be set (fwd strand, within 2bp)
+    try testing.expect(s.csq.splice_donor);
+    // The insertion G>GT preserves the donor dinucleotide "GT" -- the extra T
+    // shifts into the splice region. So the donor site IS synonymous.
+    try testing.expect(s.csq.synonymous_variant);
+    // kref and kalt should have been built
+    try testing.expect(s.kref.items.len > 0);
+    try testing.expect(s.kalt.items.len > 0);
+}
+
+test "buildHap via spliceCsqIns: non-synonymous insertion at donor" {
+    // Insertion G>GA at position 108 (first intron base) — changes the donor.
+    const ref_seq = "NNNNNNNNNNATGCCCAGGTACNNNNNNN";
+    const tr_beg: u32 = 100;
+
+    var tr = makeTestTranscriptAt(.forward, tr_beg, 117);
+    defer tr.deinit();
+
+    var s = Splice.init(testing.allocator, &tr);
+    defer s.deinit();
+
+    s.reset(108, 1, 1, "G", "GA");
+    s.flags.check_donor = true;
+    s.flags.check_region_end = true;
+    s.flags.set_refalt = true;
+    s.tr_ref = ref_seq;
+
+    const result = s.spliceCsq(100, 107);
+
+    try testing.expectEqual(SpliceResult.outside, result);
+    try testing.expect(s.csq.splice_donor);
+    // G>GA: kref donor = "GT", kalt donor = "GA" — NOT synonymous
+    try testing.expect(!s.csq.synonymous_variant);
 }

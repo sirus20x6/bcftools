@@ -187,23 +187,45 @@ pub const GffParser = struct {
     pub fn parse(self: *GffParser, fname: []const u8) !void {
         const file = try std.fs.cwd().openFile(fname, .{});
         defer file.close();
-        try self.parseReader(file.reader());
+
+        const content = try file.readToEndAlloc(self.allocator, 512 * 1024 * 1024);
+        defer self.allocator.free(content);
+
+        try self.parseContent(content);
     }
 
     /// Parse GFF3 data from any reader (useful for testing with in-memory data).
     pub fn parseReader(self: *GffParser, reader: anytype) !void {
+        // Read all content into memory first, then delegate to parseContent.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+
+        // Read in chunks
+        var tmp: [8192]u8 = undefined;
+        while (true) {
+            const n = reader.read(&tmp) catch break;
+            if (n == 0) break;
+            try buf.appendSlice(self.allocator, tmp[0..n]);
+        }
+
+        try self.parseContent(buf.items);
+    }
+
+    /// Parse GFF3 data from in-memory content.
+    pub fn parseContent(self: *GffParser, content: []const u8) !void {
         const arena_alloc = self.arena.allocator();
 
         // Phase 1: collect features (exon/CDS/UTR) and register genes + transcripts
         var features: std.ArrayList(Feature) = .empty;
         defer features.deinit(self.allocator);
 
-        var buf: [8192]u8 = undefined;
-        while (true) {
-            const line = reader.readUntilDelimiter(&buf, '\n') catch |err| switch (err) {
-                error.EndOfStream => break,
-                else => return err,
-            };
+        var remaining = content;
+        while (remaining.len > 0) {
+            // Find end of line
+            const nl_pos = std.mem.indexOfScalar(u8, remaining, '\n');
+            const line = if (nl_pos) |pos| remaining[0..pos] else remaining;
+            remaining = if (nl_pos) |pos| remaining[pos + 1 ..] else remaining[remaining.len..];
+
             // Strip trailing \r if present
             const clean = if (line.len > 0 and line[line.len - 1] == '\r')
                 line[0 .. line.len - 1]

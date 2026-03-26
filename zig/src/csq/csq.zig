@@ -9,6 +9,18 @@
 
 const std = @import("std");
 const format = @import("format.zig");
+const splice_mod = @import("splice.zig");
+const gff_mod = @import("../gff/gff.zig");
+const gff_types = @import("../gff/types.zig");
+const region = @import("../core/region.zig");
+
+const Splice = splice_mod.Splice;
+const SpliceResult = splice_mod.SpliceResult;
+const GffParser = gff_mod.GffParser;
+const Transcript = gff_types.Transcript;
+const CdsEntry = gff_types.CdsEntry;
+const Utr = gff_types.Utr;
+const Exon = gff_types.Exon;
 
 // Re-export format types used in public API
 pub const Vcsq = format.Vcsq;
@@ -83,11 +95,11 @@ pub const VcfRecord = struct {
     n_allele: u32,
     alleles: []const []const u8,
     rlen: u32,
+    /// Chromosome/sequence name for region index lookups.
+    chr: []const u8 = "unknown",
 
     pub fn seqname(self: *const VcfRecord) []const u8 {
-        // TODO: get from header via htslib binding
-        _ = self;
-        return "unknown";
+        return self.chr;
     }
 };
 
@@ -250,14 +262,8 @@ pub const Options = struct {
 pub const CsqContext = struct {
     allocator: std.mem.Allocator,
 
-    // GFF annotation — TODO: replace with gff_mod.GffParser once available
-    // gff: gff_mod.GffParser,
-
-    // Region indexes — TODO: populated from GFF parser
-    // idx_cds: *RegionIndex,
-    // idx_utr: *RegionIndex,
-    // idx_exon: *RegionIndex,
-    // idx_tscript: *RegionIndex,
+    // GFF annotation — provides region indexes for CDS, UTR, exon, transcript lookups
+    gff: ?*GffParser,
 
     // Haplotype processing — TODO: wire haplotype.HapContext
     // hap_ctx: haplotype.HapContext,
@@ -306,6 +312,7 @@ pub const CsqContext = struct {
 
         return CsqContext{
             .allocator = allocator,
+            .gff = null,
             .pos2vbuf = std.AutoHashMap(u32, usize).init(allocator),
             .vcf_rbuf = try RingBuffer(*Vbuf).init(allocator, 64),
             .csq_buf = .empty,
@@ -544,37 +551,109 @@ pub const CsqContext = struct {
     /// Check if the variant overlaps coding sequences and build haplotype nodes.
     ///
     /// Port of test_cds() from csq.c (line 3075).
-    /// TODO: requires GFF RegionIndex (idx_cds) and haplotype tree operations.
+    /// For the haplotype-aware path, this queries the CDS region index and
+    /// extends the per-transcript haplotype tree. Currently implements the
+    /// drop_gt (no-genotype) simplified path; full sample-aware haplotype
+    /// extension requires htslib genotype access.
     fn testCds(self: *CsqContext, rec: *const VcfRecord, vbuf: *Vbuf) !bool {
-        _ = self;
-        _ = rec;
-        _ = vbuf;
-        // TODO: Implementation steps:
-        // 1. regidx_overlap(idx_cds, chr, rec.pos, rec.pos + rec.rlen)
-        // 2. For each overlapping CDS:
-        //    a. Get transcript, check if coding
-        //    b. Set vbuf.keep_until = max(keep_until, tr.end)
-        //    c. Initialize transcript aux if needed (fetch ref, build haplotype root)
-        //    d. Sanity-check ref allele
-        //    e. For phase==drop_gt: single haplotype path
-        //    f. Otherwise: iterate samples/haplotypes, extend tree
-        return false;
+        const gff = self.gff orelse return false;
+        const chr = rec.seqname();
+
+        // Note: off-by-one extension of rlen is deliberate to account for insertions
+        var itr = gff.idx_cds.overlap(chr, rec.pos, rec.pos + rec.rlen);
+
+        var ret = false;
+        while (itr.next()) |interval| {
+            const cds: *CdsEntry = interval.payload;
+            const tr: *Transcript = cds.tr;
+            if (!tr.biotype.isCoding()) continue;
+
+            // Extend the vbuf keep_until to cover the full transcript
+            if (vbuf.keep_until < tr.end) vbuf.keep_until = tr.end;
+            ret = true;
+
+            // TODO: Initialize transcript aux if first time:
+            //   - tscript_init_ref: fetch reference sequence from fasta
+            //   - Create haplotype tree root node
+            //   - Add to active_transcripts heap
+            // TODO: sanity_check_ref: verify VCF REF matches fasta
+
+            if (self.phase == .drop_gt) {
+                // Simplified path: single haplotype, no genotype tracking.
+                // Skip symbolic/star alleles.
+                if (rec.alleles.len < 2) continue;
+                const alt = rec.alleles[1];
+                if (alt.len > 0 and (alt[0] == '<' or alt[0] == '*')) continue;
+
+                // TODO: Full implementation requires:
+                //   - hap_init to create child node from parent
+                //   - If HAP_SSS: stage splice consequence directly
+                //   - Otherwise: attach child to haplotype tree
+                // For now, we mark the hit so downstream tests (UTR/intron) are skipped.
+                continue;
+            }
+
+            // TODO: Full sample-aware haplotype extension:
+            //   - bcf_get_genotypes per sample
+            //   - For each het/hom-alt, extend the haplotype tree leaf
+        }
+        return ret;
     }
 
     /// Local (non-haplotype-aware) CDS consequence calling.
     ///
     /// Port of test_cds_local() from csq.c (line 2872).
+    /// Queries the CDS region index and, for each overlapping CDS and each alt
+    /// allele, determines the coding consequence. This is the simplified path
+    /// that does not track per-sample haplotypes.
     fn testCdsLocal(self: *CsqContext, rec: *const VcfRecord) !bool {
-        _ = self;
-        _ = rec;
-        // TODO: Implementation steps:
-        // 1. regidx_overlap(idx_cds, chr, rec.pos, rec.pos + rec.rlen)
-        // 2. For each overlapping CDS:
-        //    a. For each alt allele, call hap_init to get single-variant node
-        //    b. If HAP_SSS: stage start/stop/splice consequence
-        //    c. Otherwise: translate ref and alt, compare amino acids
-        //    d. Build csq with protein/DNA change string, call csqStage
-        return false;
+        const gff = self.gff orelse return false;
+        const chr = rec.seqname();
+
+        var itr = gff.idx_cds.overlap(chr, rec.pos, rec.pos + rec.rlen);
+
+        var ret = false;
+        while (itr.next()) |interval| {
+            const cds: *CdsEntry = interval.payload;
+            const tr: *Transcript = cds.tr;
+            if (!tr.biotype.isCoding()) continue;
+            ret = true;
+
+            // TODO: Initialize transcript aux if first time (tscript_init_ref)
+            // TODO: sanity_check_ref
+
+            // For each alt allele
+            var ial: u32 = 1;
+            while (ial < rec.n_allele) : (ial += 1) {
+                if (ial >= rec.alleles.len) break;
+                const alt = rec.alleles[ial];
+                if (alt.len > 0 and (alt[0] == '<' or alt[0] == '*')) continue;
+
+                // TODO: Full implementation requires:
+                //   - hap_init with a temporary root to get a single-variant node
+                //   - If HAP_SSS: stage the splice consequence via csqStage
+                //   - Otherwise: translate ref and alt CDS, compare amino acids,
+                //     determine missense/synonymous/stop_gained/frameshift/etc.
+                //   - Build variant string and call csqStage
+
+                // For now, stage a coding_sequence consequence as a placeholder
+                // to indicate we found a CDS hit. This ensures the cascade
+                // correctly skips UTR/intron tests.
+                var csq = Csq{
+                    .pos = rec.pos,
+                    .vcsq = .{
+                        .csq_type = CSQ_CODING_SEQUENCE,
+                        .biotype = @intFromEnum(tr.biotype),
+                        .strand = if (tr.strand == .forward) .fwd else .rev,
+                        .trid = tr.id,
+                        .vcf_ial = ial,
+                        .gene = if (tr.gene) |g| @as(?[]const u8, if (g.name) |n| std.mem.span(n) else null) else null,
+                    },
+                };
+                try self.csqStage(&csq, rec);
+            }
+        }
+        return ret;
     }
 
     // -----------------------------------------------------------------
@@ -584,16 +663,63 @@ pub const CsqContext = struct {
     /// Check if the variant overlaps UTR regions.
     ///
     /// Port of test_utr() from csq.c (line 3360).
+    /// Queries the UTR region index. For each overlapping UTR and each alt
+    /// allele, runs splice analysis and stages a UTR5 or UTR3 consequence
+    /// if the variant falls inside the UTR.
     fn testUtr(self: *CsqContext, rec: *const VcfRecord) !bool {
-        _ = self;
-        _ = rec;
-        // TODO: Implementation steps:
-        // 1. regidx_overlap(idx_utr, chr, rec.pos, rec.pos + rec.rlen)
-        // 2. For each overlapping UTR:
-        //    a. For each alt allele, check splice consequences
-        //    b. If inside/overlap: create UTR5 or UTR3 consequence
-        //    c. Call csqStage
-        return false;
+        const gff = self.gff orelse return false;
+        const chr = rec.seqname();
+
+        var itr = gff.idx_utr.overlap(chr, rec.pos, rec.pos + rec.rlen);
+
+        var ret = false;
+        while (itr.next()) |interval| {
+            const utr: *Utr = interval.payload;
+            const tr: *Transcript = utr.tr;
+
+            // For each alt allele
+            var ial: u32 = 1;
+            while (ial < rec.n_allele) : (ial += 1) {
+                if (ial >= rec.alleles.len) break;
+                const alt = rec.alleles[ial];
+                if (alt.len > 0 and (alt[0] == '<' or alt[0] == '*')) continue;
+
+                const ref_allele = rec.alleles[0];
+
+                // Run splice analysis
+                var splice = Splice.init(self.allocator, tr);
+                defer splice.deinit();
+
+                splice.reset(
+                    @intCast(rec.pos),
+                    @intCast(ref_allele.len),
+                    @intCast(ial),
+                    ref_allele,
+                    alt,
+                );
+
+                const splice_ret = splice.spliceCsq(utr.beg, utr.end);
+                if (splice_ret != .inside and splice_ret != .overlap) continue;
+
+                // Determine UTR type
+                const utr_csq: CsqType = if (utr.which == .prime5) CSQ_UTR5 else CSQ_UTR3;
+
+                var csq = Csq{
+                    .pos = rec.pos,
+                    .vcsq = .{
+                        .csq_type = utr_csq,
+                        .biotype = @intFromEnum(tr.biotype),
+                        .strand = if (tr.strand == .forward) .fwd else .rev,
+                        .trid = tr.id,
+                        .vcf_ial = ial,
+                        .gene = if (tr.gene) |g| @as(?[]const u8, if (g.name) |n| std.mem.span(n) else null) else null,
+                    },
+                };
+                try self.csqStage(&csq, rec);
+                ret = true;
+            }
+        }
+        return ret;
     }
 
     // -----------------------------------------------------------------
@@ -603,16 +729,78 @@ pub const CsqContext = struct {
     /// Check if the variant affects splice sites.
     ///
     /// Port of test_splice() from csq.c (line 3400).
+    /// Queries the exon region index. For each overlapping exon in a coding
+    /// transcript, runs splice analysis with donor/acceptor checking enabled.
+    /// Splice consequences are staged within the splice analysis itself
+    /// (via the csq flags on the Splice struct); here we just check if any
+    /// consequence was set and return accordingly.
     fn testSplice(self: *CsqContext, rec: *const VcfRecord) !bool {
-        _ = self;
-        _ = rec;
-        // TODO: Implementation steps:
-        // 1. regidx_overlap(idx_exon, chr, rec.pos, rec.pos + rec.rlen)
-        // 2. For each overlapping exon:
-        //    a. Skip non-coding transcripts (ncds == 0)
-        //    b. Check region boundaries for acceptor/donor
-        //    c. For each alt allele, call splice_csq
-        return false;
+        const gff = self.gff orelse return false;
+        const chr = rec.seqname();
+
+        var itr = gff.idx_exon.overlap(chr, rec.pos, rec.pos + rec.rlen);
+
+        var ret = false;
+        while (itr.next()) |interval| {
+            const exon: *Exon = interval.payload;
+            const tr: *Transcript = exon.tr;
+
+            // Skip non-coding transcripts (no CDS entries)
+            if (tr.cds.items.len == 0) continue;
+
+            // Determine whether to check region boundaries.
+            // If the exon starts/ends at the transcript boundary, there is no
+            // intron on that side, so don't check for splice region there.
+            const check_region_beg = tr.beg != exon.beg;
+            const check_region_end = tr.end != exon.end;
+
+            // For each alt allele
+            var ial: u32 = 1;
+            while (ial < rec.n_allele) : (ial += 1) {
+                if (ial >= rec.alleles.len) break;
+                const alt = rec.alleles[ial];
+                if (alt.len > 0 and (alt[0] == '<' or alt[0] == '*')) continue;
+
+                const ref_allele = rec.alleles[0];
+
+                var splice = Splice.init(self.allocator, tr);
+                defer splice.deinit();
+
+                splice.reset(
+                    @intCast(rec.pos),
+                    @intCast(ref_allele.len),
+                    @intCast(ial),
+                    ref_allele,
+                    alt,
+                );
+
+                // Enable donor/acceptor checking (the key difference from testUtr)
+                splice.flags.check_donor = true;
+                splice.flags.check_acceptor = true;
+                splice.flags.check_region_beg = check_region_beg;
+                splice.flags.check_region_end = check_region_end;
+
+                _ = splice.spliceCsq(exon.beg, exon.end);
+
+                // If any splice consequence was set, stage it
+                if (splice.csq.toInt() != 0) {
+                    var csq = Csq{
+                        .pos = rec.pos,
+                        .vcsq = .{
+                            .csq_type = splice.csq.toInt(),
+                            .biotype = @intFromEnum(tr.biotype),
+                            .strand = if (tr.strand == .forward) .fwd else .rev,
+                            .trid = tr.id,
+                            .vcf_ial = ial,
+                            .gene = if (tr.gene) |g| @as(?[]const u8, if (g.name) |n| std.mem.span(n) else null) else null,
+                        },
+                    };
+                    try self.csqStage(&csq, rec);
+                    ret = true;
+                }
+            }
+        }
+        return ret;
     }
 
     // -----------------------------------------------------------------
@@ -622,16 +810,62 @@ pub const CsqContext = struct {
     /// Check if the variant falls within a transcript (intron or non-coding).
     ///
     /// Port of test_tscript() from csq.c (line 3434).
+    /// Queries the transcript region index. For each overlapping transcript
+    /// and each alt allele, runs splice analysis against the full transcript
+    /// span. If the variant is inside/overlapping, it is classified as INTRON
+    /// (for coding transcripts) or NON_CODING (for non-coding transcripts).
     fn testTscript(self: *CsqContext, rec: *const VcfRecord) !bool {
-        _ = self;
-        _ = rec;
-        // TODO: Implementation steps:
-        // 1. regidx_overlap(idx_tscript, chr, rec.pos, rec.pos + rec.rlen)
-        // 2. For each overlapping transcript:
-        //    a. For each alt allele, call splice_csq to check boundaries
-        //    b. If inside/overlap: create INTRON (coding) or NON_CODING consequence
-        //    c. Call csqStage
-        return false;
+        const gff = self.gff orelse return false;
+        const chr = rec.seqname();
+
+        var itr = gff.idx_tscript.overlap(chr, rec.pos, rec.pos + rec.rlen);
+
+        var ret = false;
+        while (itr.next()) |interval| {
+            const tr: *Transcript = interval.payload;
+
+            // For each alt allele
+            var ial: u32 = 1;
+            while (ial < rec.n_allele) : (ial += 1) {
+                if (ial >= rec.alleles.len) break;
+                const alt = rec.alleles[ial];
+                if (alt.len > 0 and (alt[0] == '<' or alt[0] == '*')) continue;
+
+                const ref_allele = rec.alleles[0];
+
+                var splice = Splice.init(self.allocator, tr);
+                defer splice.deinit();
+
+                splice.reset(
+                    @intCast(rec.pos),
+                    @intCast(ref_allele.len),
+                    @intCast(ial),
+                    ref_allele,
+                    alt,
+                );
+
+                const splice_ret = splice.spliceCsq(tr.beg, tr.end);
+                if (splice_ret != .inside and splice_ret != .overlap) continue;
+
+                // Coding transcript -> INTRON; non-coding -> NON_CODING
+                const csq_type: CsqType = if (tr.biotype.isCoding()) CSQ_INTRON else CSQ_NON_CODING;
+
+                var csq = Csq{
+                    .pos = rec.pos,
+                    .vcsq = .{
+                        .csq_type = csq_type,
+                        .biotype = @intFromEnum(tr.biotype),
+                        .strand = if (tr.strand == .forward) .fwd else .rev,
+                        .trid = tr.id,
+                        .vcf_ial = ial,
+                        .gene = if (tr.gene) |g| @as(?[]const u8, if (g.name) |n| std.mem.span(n) else null) else null,
+                    },
+                };
+                try self.csqStage(&csq, rec);
+                ret = true;
+            }
+        }
+        return ret;
     }
 
     // -----------------------------------------------------------------
@@ -943,4 +1177,427 @@ test "ncsq2ToNfmt calculation" {
     try std.testing.expectEqual(@as(u32, 1), CsqContext.ncsq2ToNfmt(1));
     try std.testing.expectEqual(@as(u32, 1), CsqContext.ncsq2ToNfmt(30));
     try std.testing.expectEqual(@as(u32, 2), CsqContext.ncsq2ToNfmt(32));
+}
+
+// ---------------------------------------------------------------------------
+// Integration tests — GFF + CSQ pipeline wiring
+// ---------------------------------------------------------------------------
+
+/// Helper: create a minimal GffParser with a single coding transcript on chr1
+/// spanning [100, 900], a CDS at [200, 400], an exon at [200, 400], a UTR5
+/// at [100, 199], and the transcript itself at [100, 900].
+fn makeTestGff(allocator: std.mem.Allocator) !*GffParser {
+    var gff = try allocator.create(GffParser);
+    gff.* = GffParser.init(allocator);
+    const arena = gff.arena.allocator();
+
+    // Create gene
+    const gene = try arena.create(gff_types.Gene);
+    gene.* = .{
+        .name = null,
+        .iseq = 0,
+        .id = 0,
+        .beg = 100,
+        .end = 900,
+        .strand = .forward,
+        .used = true,
+    };
+
+    // Create transcript
+    const tr = try arena.create(Transcript);
+    tr.* = Transcript.init(arena);
+    tr.id = 0;
+    tr.beg = 100;
+    tr.end = 900;
+    tr.strand = .forward;
+    tr.biotype = .protein_coding;
+    tr.gene = gene;
+
+    // Create CDS entry
+    const cds = try arena.create(CdsEntry);
+    cds.* = .{
+        .tr = tr,
+        .beg = 200,
+        .pos = 0,
+        .len = 201,
+        .icds = 0,
+        .phase = .phase0,
+    };
+    try tr.cds.append(arena, cds);
+
+    // Insert into region indexes
+    try gff.idx_cds.insert("chr1", 200, 400, cds);
+
+    const utr = try arena.create(Utr);
+    utr.* = .{
+        .which = .prime5,
+        .beg = 100,
+        .end = 199,
+        .tr = tr,
+    };
+    try gff.idx_utr.insert("chr1", 100, 199, utr);
+
+    const exon = try arena.create(Exon);
+    exon.* = .{
+        .beg = 200,
+        .end = 400,
+        .tr = tr,
+    };
+    try gff.idx_exon.insert("chr1", 200, 400, exon);
+
+    try gff.idx_tscript.insert("chr1", 100, 900, tr);
+
+    return gff;
+}
+
+fn destroyTestGff(allocator: std.mem.Allocator, gff: *GffParser) void {
+    gff.deinit();
+    allocator.destroy(gff);
+}
+
+test "testCds: variant overlapping CDS is detected" {
+    const allocator = std.testing.allocator;
+
+    const gff = try makeTestGff(allocator);
+    defer destroyTestGff(allocator, gff);
+
+    var ctx = try CsqContext.init(allocator, .{
+        .gff_fname = "test.gff",
+        .phase = .drop_gt,
+    });
+    defer ctx.deinit();
+    ctx.gff = gff;
+
+    const alleles = [_][]const u8{ "A", "T" };
+    var rec = VcfRecord{
+        .pos = 250,
+        .rid = 0,
+        .n_allele = 2,
+        .alleles = &alleles,
+        .rlen = 1,
+        .chr = "chr1",
+    };
+
+    const vbuf = try ctx.vbufPush(&rec);
+    const hit = try ctx.testCds(&rec, vbuf);
+
+    try std.testing.expect(hit);
+    // keep_until should be extended to transcript end
+    try std.testing.expectEqual(@as(u32, 900), vbuf.keep_until);
+}
+
+test "testCds: variant outside CDS is not detected" {
+    const allocator = std.testing.allocator;
+
+    const gff = try makeTestGff(allocator);
+    defer destroyTestGff(allocator, gff);
+
+    var ctx = try CsqContext.init(allocator, .{
+        .gff_fname = "test.gff",
+        .phase = .drop_gt,
+    });
+    defer ctx.deinit();
+    ctx.gff = gff;
+
+    const alleles = [_][]const u8{ "A", "T" };
+    // Position 500 is outside the CDS [200, 400]
+    var rec = VcfRecord{
+        .pos = 500,
+        .rid = 0,
+        .n_allele = 2,
+        .alleles = &alleles,
+        .rlen = 1,
+        .chr = "chr1",
+    };
+
+    const vbuf = try ctx.vbufPush(&rec);
+    const hit = try ctx.testCds(&rec, vbuf);
+
+    try std.testing.expect(!hit);
+}
+
+test "testCdsLocal: variant overlapping CDS stages coding_sequence" {
+    const allocator = std.testing.allocator;
+
+    const gff = try makeTestGff(allocator);
+    defer destroyTestGff(allocator, gff);
+
+    var ctx = try CsqContext.init(allocator, .{
+        .gff_fname = "test.gff",
+        .phase = .drop_gt,
+        .local_csq = true,
+    });
+    defer ctx.deinit();
+    ctx.gff = gff;
+
+    const alleles = [_][]const u8{ "A", "T" };
+    var rec = VcfRecord{
+        .pos = 300,
+        .rid = 0,
+        .n_allele = 2,
+        .alleles = &alleles,
+        .rlen = 1,
+        .chr = "chr1",
+    };
+
+    _ = try ctx.vbufPush(&rec);
+    const hit = try ctx.testCdsLocal(&rec);
+
+    try std.testing.expect(hit);
+
+    // Check that a consequence was staged on the vrec
+    const vbuf = ctx.vcf_rbuf.front().?;
+    const vrec = &vbuf.vrecs.items[0];
+    try std.testing.expect(vrec.vcsqs.items.len > 0);
+    try std.testing.expect(vrec.vcsqs.items[0].csq_type & CSQ_CODING_SEQUENCE != 0);
+}
+
+test "testUtr: variant in UTR5 region is detected" {
+    const allocator = std.testing.allocator;
+
+    const gff = try makeTestGff(allocator);
+    defer destroyTestGff(allocator, gff);
+
+    var ctx = try CsqContext.init(allocator, .{
+        .gff_fname = "test.gff",
+        .phase = .drop_gt,
+    });
+    defer ctx.deinit();
+    ctx.gff = gff;
+
+    const alleles = [_][]const u8{ "A", "T" };
+    // Position 150 is inside UTR5 [100, 199]
+    var rec = VcfRecord{
+        .pos = 150,
+        .rid = 0,
+        .n_allele = 2,
+        .alleles = &alleles,
+        .rlen = 1,
+        .chr = "chr1",
+    };
+
+    _ = try ctx.vbufPush(&rec);
+    const hit = try ctx.testUtr(&rec);
+
+    try std.testing.expect(hit);
+
+    // Check that UTR5 consequence was staged
+    const vbuf = ctx.vcf_rbuf.front().?;
+    const vrec = &vbuf.vrecs.items[0];
+    try std.testing.expect(vrec.vcsqs.items.len > 0);
+    try std.testing.expect(vrec.vcsqs.items[0].csq_type & CSQ_UTR5 != 0);
+}
+
+test "testTscript: intronic variant in coding transcript gets INTRON" {
+    const allocator = std.testing.allocator;
+
+    const gff = try makeTestGff(allocator);
+    defer destroyTestGff(allocator, gff);
+
+    var ctx = try CsqContext.init(allocator, .{
+        .gff_fname = "test.gff",
+        .phase = .drop_gt,
+    });
+    defer ctx.deinit();
+    ctx.gff = gff;
+
+    const alleles = [_][]const u8{ "A", "T" };
+    // Position 500 is inside transcript [100, 900] but outside CDS [200, 400]
+    var rec = VcfRecord{
+        .pos = 500,
+        .rid = 0,
+        .n_allele = 2,
+        .alleles = &alleles,
+        .rlen = 1,
+        .chr = "chr1",
+    };
+
+    _ = try ctx.vbufPush(&rec);
+    const hit = try ctx.testTscript(&rec);
+
+    try std.testing.expect(hit);
+
+    // Check that INTRON consequence was staged (protein_coding is coding)
+    const vbuf = ctx.vcf_rbuf.front().?;
+    const vrec = &vbuf.vrecs.items[0];
+    try std.testing.expect(vrec.vcsqs.items.len > 0);
+    try std.testing.expect(vrec.vcsqs.items[0].csq_type & CSQ_INTRON != 0);
+}
+
+test "testTscript: variant in non-coding transcript gets NON_CODING" {
+    const allocator = std.testing.allocator;
+
+    // Build a custom GFF with a non-coding transcript
+    var gff = try allocator.create(GffParser);
+    defer {
+        gff.deinit();
+        allocator.destroy(gff);
+    }
+    gff.* = GffParser.init(allocator);
+    const arena = gff.arena.allocator();
+
+    const gene = try arena.create(gff_types.Gene);
+    gene.* = .{
+        .name = null,
+        .iseq = 0,
+        .id = 0,
+        .beg = 100,
+        .end = 900,
+        .strand = .forward,
+        .used = true,
+    };
+
+    const tr = try arena.create(Transcript);
+    tr.* = Transcript.init(arena);
+    tr.id = 0;
+    tr.beg = 100;
+    tr.end = 900;
+    tr.strand = .forward;
+    tr.biotype = .lncRNA; // non-coding
+    tr.gene = gene;
+
+    try gff.idx_tscript.insert("chr1", 100, 900, tr);
+
+    var ctx = try CsqContext.init(allocator, .{
+        .gff_fname = "test.gff",
+        .phase = .drop_gt,
+    });
+    defer ctx.deinit();
+    ctx.gff = gff;
+
+    const alleles = [_][]const u8{ "A", "T" };
+    var rec = VcfRecord{
+        .pos = 500,
+        .rid = 0,
+        .n_allele = 2,
+        .alleles = &alleles,
+        .rlen = 1,
+        .chr = "chr1",
+    };
+
+    _ = try ctx.vbufPush(&rec);
+    const hit = try ctx.testTscript(&rec);
+
+    try std.testing.expect(hit);
+
+    const vbuf = ctx.vcf_rbuf.front().?;
+    const vrec = &vbuf.vrecs.items[0];
+    try std.testing.expect(vrec.vcsqs.items.len > 0);
+    try std.testing.expect(vrec.vcsqs.items[0].csq_type & CSQ_NON_CODING != 0);
+}
+
+test "testSplice: variant near exon boundary sets splice consequence" {
+    const allocator = std.testing.allocator;
+
+    const gff = try makeTestGff(allocator);
+    defer destroyTestGff(allocator, gff);
+
+    var ctx = try CsqContext.init(allocator, .{
+        .gff_fname = "test.gff",
+        .phase = .drop_gt,
+    });
+    defer ctx.deinit();
+    ctx.gff = gff;
+
+    const alleles = [_][]const u8{ "A", "T" };
+    // Position 399 is within the last 3bp of exon [200, 400], which triggers
+    // splice_region via checkExonEnd. The exon end != transcript end, so
+    // check_region_end is set.
+    var rec = VcfRecord{
+        .pos = 399,
+        .rid = 0,
+        .n_allele = 2,
+        .alleles = &alleles,
+        .rlen = 1,
+        .chr = "chr1",
+    };
+
+    _ = try ctx.vbufPush(&rec);
+    const hit = try ctx.testSplice(&rec);
+
+    try std.testing.expect(hit);
+
+    // Check that a splice consequence was staged
+    const vbuf = ctx.vcf_rbuf.front().?;
+    const vrec = &vbuf.vrecs.items[0];
+    try std.testing.expect(vrec.vcsqs.items.len > 0);
+    // Should have splice_region set (within last 3bp of exon, check_region_end enabled)
+    try std.testing.expect(vrec.vcsqs.items[0].csq_type & CSQ_SPLICE_REGION != 0);
+}
+
+test "testSplice: variant far from exon boundary has no splice consequence" {
+    const allocator = std.testing.allocator;
+
+    const gff = try makeTestGff(allocator);
+    defer destroyTestGff(allocator, gff);
+
+    var ctx = try CsqContext.init(allocator, .{
+        .gff_fname = "test.gff",
+        .phase = .drop_gt,
+    });
+    defer ctx.deinit();
+    ctx.gff = gff;
+
+    const alleles = [_][]const u8{ "A", "T" };
+    // Position 500 is well outside the exon [200, 400] and beyond the
+    // splice region window (8bp)
+    var rec = VcfRecord{
+        .pos = 500,
+        .rid = 0,
+        .n_allele = 2,
+        .alleles = &alleles,
+        .rlen = 1,
+        .chr = "chr1",
+    };
+
+    _ = try ctx.vbufPush(&rec);
+    const hit = try ctx.testSplice(&rec);
+
+    // No exon overlaps position 500, so no splice hit
+    try std.testing.expect(!hit);
+}
+
+test "process: full cascade CDS -> UTR -> splice -> tscript" {
+    const allocator = std.testing.allocator;
+
+    const gff = try makeTestGff(allocator);
+    defer destroyTestGff(allocator, gff);
+
+    var ctx = try CsqContext.init(allocator, .{
+        .gff_fname = "test.gff",
+        .phase = .drop_gt,
+        .local_csq = true,
+    });
+    defer ctx.deinit();
+    ctx.gff = gff;
+
+    // Variant in CDS region
+    const alleles_cds = [_][]const u8{ "A", "T" };
+    var rec_cds = VcfRecord{
+        .pos = 300,
+        .rid = 0,
+        .n_allele = 2,
+        .alleles = &alleles_cds,
+        .rlen = 1,
+        .chr = "chr1",
+    };
+    try ctx.process(&rec_cds);
+
+    // Variant in intron (outside CDS, inside transcript)
+    const alleles_intr = [_][]const u8{ "G", "C" };
+    var rec_intron = VcfRecord{
+        .pos = 500,
+        .rid = 0,
+        .n_allele = 2,
+        .alleles = &alleles_intr,
+        .rlen = 1,
+        .chr = "chr1",
+    };
+    try ctx.process(&rec_intron);
+
+    // Flush everything
+    try ctx.flush();
+
+    // Verify that both records were processed (ring buffer is empty after flush)
+    try std.testing.expectEqual(@as(usize, 0), ctx.vcf_rbuf.len);
 }
