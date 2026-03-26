@@ -296,10 +296,10 @@ pub const HapNode = struct {
     /// Previous coding node.
     prev: ?*HapNode = null,
 
-    /// The VCF record that created this node.
-    rec: ?*VcfRecord = null,
-    /// Current VCF record during traversal.
-    cur_rec: ?*VcfRecord = null,
+    /// The VCF record that created this node (type-erased pointer for identity comparison).
+    rec: ?*const anyopaque = null,
+    /// Current VCF record during traversal (type-erased pointer for identity comparison).
+    cur_rec: ?*const anyopaque = null,
     /// Which VCF ALT allele generated this node.
     vcf_ial: i32 = 0,
     /// Number of haplotypes ending at this node.

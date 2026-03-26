@@ -29,6 +29,19 @@ const Tscript = types.Tscript;
 const HapNode = types.HapNode;
 const HapNodeType = types.HapNodeType;
 const HapInitResult = haplotype_mod.HapInitResult;
+const HapContext = haplotype_mod.HapContext;
+
+// ---------------------------------------------------------------------------
+// ActiveTranscriptQueue -- min-heap of transcripts sorted by end position
+// ---------------------------------------------------------------------------
+
+/// Priority queue of active transcripts, ordered by ascending `.end` position.
+/// Used to determine which transcripts have been fully traversed at a given
+/// genomic position so their haplotype trees can be finalized.
+fn trLessThan(_: void, a: *Transcript, b: *Transcript) std.math.Order {
+    return std.math.order(a.end, b.end);
+}
+const ActiveTranscriptQueue = std.PriorityQueue(*Transcript, void, trLessThan);
 
 // Re-export format types used in public API
 pub const Vcsq = format.Vcsq;
@@ -95,6 +108,54 @@ pub const Phase = enum {
 // Placeholder VCF record (until full htslib wrapper exists)
 // ---------------------------------------------------------------------------
 
+/// Parsed genotype for a single sample.
+pub const Genotype = struct {
+    /// Allele indices: -1 for missing, 0 for ref, 1+ for alt.
+    alleles: [2]i32,
+    /// Whether the genotype separator was '|' (phased).
+    phased: bool,
+    /// Number of alleles present (1 for haploid, 2 for diploid).
+    ploidy: u8,
+
+    /// Parse a single GT string like "0/1", "1|0", "./.", "0", "1", ".".
+    pub fn parse(gt_str: []const u8) Genotype {
+        if (gt_str.len == 0) return .{ .alleles = .{ -1, -1 }, .phased = false, .ploidy = 0 };
+
+        var result = Genotype{ .alleles = .{ -1, -1 }, .phased = false, .ploidy = 1 };
+        var sep_pos: ?usize = null;
+
+        for (gt_str, 0..) |c, idx| {
+            if (c == '/' or c == '|') {
+                if (c == '|') result.phased = true;
+                sep_pos = idx;
+                result.ploidy = 2;
+                break;
+            }
+        }
+
+        // Parse first allele
+        const first_end = sep_pos orelse gt_str.len;
+        const first = gt_str[0..first_end];
+        if (first.len == 1 and first[0] == '.') {
+            result.alleles[0] = -1;
+        } else {
+            result.alleles[0] = std.fmt.parseInt(i32, first, 10) catch -1;
+        }
+
+        // Parse second allele if present
+        if (sep_pos) |sp| {
+            const second = gt_str[sp + 1 ..];
+            if (second.len == 1 and second[0] == '.') {
+                result.alleles[1] = -1;
+            } else {
+                result.alleles[1] = std.fmt.parseInt(i32, second, 10) catch -1;
+            }
+        }
+
+        return result;
+    }
+};
+
 /// Minimal VCF record representation for the CSQ pipeline.
 /// This will be replaced by a proper htslib binding wrapper.
 pub const VcfRecord = struct {
@@ -105,6 +166,10 @@ pub const VcfRecord = struct {
     rlen: u32,
     /// Chromosome/sequence name for region index lookups.
     chr: []const u8 = "unknown",
+    /// Raw VCF line for genotype parsing (optional, used for text VCF input).
+    raw_line: ?[]const u8 = null,
+    /// Cached parsed genotypes (one per sample, lazily populated).
+    gt_cache: ?[]Genotype = null,
 
     pub fn seqname(self: *const VcfRecord) []const u8 {
         return self.chr;
@@ -125,6 +190,81 @@ pub const VcfRecord = struct {
             }
         }
         return "unknown";
+    }
+
+    /// Parse genotypes from the raw VCF line for all samples.
+    /// Returns a slice of Genotype, one per sample, or null if no genotypes.
+    /// The GT field must be the first subfield in FORMAT.
+    pub fn parseGenotypes(self: *const VcfRecord, allocator: std.mem.Allocator) !?[]Genotype {
+        // If already cached, return cached
+        if (self.gt_cache) |cached| return cached;
+
+        const line = self.raw_line orelse return null;
+
+        // Find FORMAT column (index 8) and sample columns (index 9+)
+        var col: usize = 0;
+        var col_start: usize = 0;
+        var format_start: usize = 0;
+        var format_end: usize = 0;
+        var samples_start: usize = 0;
+
+        for (line, 0..) |c, idx| {
+            if (c == '\t') {
+                if (col == 8) {
+                    format_start = col_start;
+                    format_end = idx;
+                    samples_start = idx + 1;
+                }
+                col += 1;
+                col_start = idx + 1;
+            }
+        }
+        // Handle if FORMAT is the last column found
+        if (col == 8) {
+            format_start = col_start;
+            format_end = line.len;
+            return null; // No sample columns
+        }
+        if (col < 9) return null; // Not enough columns for FORMAT + samples
+
+        // Check that GT is the first FORMAT subfield
+        const format_field = line[format_start..format_end];
+        const gt_ok = if (format_field.len >= 2)
+            (std.mem.startsWith(u8, format_field, "GT\t") or
+                std.mem.startsWith(u8, format_field, "GT:") or
+                std.mem.eql(u8, format_field, "GT"))
+        else
+            false;
+        if (!gt_ok) return null;
+
+        // Count samples
+        var n_samples: usize = 1;
+        for (line[samples_start..]) |c| {
+            if (c == '\t') n_samples += 1;
+        }
+
+        var genotypes = try allocator.alloc(Genotype, n_samples);
+
+        // Parse each sample's GT field (first subfield before ':')
+        var smpl_idx: usize = 0;
+        var pos: usize = samples_start;
+        while (smpl_idx < n_samples) : (smpl_idx += 1) {
+            // Find the end of the GT subfield (first ':' or '\t' or end of line)
+            var gt_end: usize = pos;
+            while (gt_end < line.len and line[gt_end] != ':' and line[gt_end] != '\t' and line[gt_end] != '\n') {
+                gt_end += 1;
+            }
+            genotypes[smpl_idx] = Genotype.parse(line[pos..gt_end]);
+
+            // Advance to the next sample (skip to next '\t')
+            var next_pos = gt_end;
+            while (next_pos < line.len and line[next_pos] != '\t') {
+                next_pos += 1;
+            }
+            pos = if (next_pos < line.len) next_pos + 1 else next_pos;
+        }
+
+        return genotypes;
     }
 };
 
@@ -309,6 +449,10 @@ pub const Options = struct {
     ncsq2_max: u32 = 15 * 2,
     gencode_id: i32 = 0,
     brief_predictions: u32 = 0,
+    /// Number of samples in the VCF.
+    n_samples: u32 = 0,
+    /// Indices of selected samples.  If null, all samples are used.
+    sample_indices: ?[]const u32 = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -321,8 +465,8 @@ pub const CsqContext = struct {
     // GFF annotation — provides region indexes for CDS, UTR, exon, transcript lookups
     gff: ?*GffParser,
 
-    // Haplotype processing — TODO: wire haplotype.HapContext
-    // hap_ctx: haplotype.HapContext,
+    // Haplotype processing
+    hap_ctx: HapContext,
 
     // FASTA reference access
     fasta_fname: []const u8,
@@ -333,9 +477,11 @@ pub const CsqContext = struct {
     pos2vbuf: std.AutoHashMap(u32, usize), // pos -> ring buffer index (for existence check)
     vcf_rbuf: RingBuffer(*Vbuf),
 
-    // Transcript management — TODO: wire gff_types.Transcript
-    // active_transcripts: heap of active transcripts for flushing
-    // rm_transcripts: list of transcripts pending cleanup
+    // Transcript management -- min-heap of active transcripts sorted by end position
+    active_transcripts: ActiveTranscriptQueue,
+    // Transcripts pending cleanup after vbuf flush (cannot delete immediately because
+    // by-position VCF output needs them when flushed by vbufFlush)
+    rm_transcripts: std.ArrayList(*Transcript),
 
     // CSQ buffer for non-CDS consequences
     csq_buf: std.ArrayList(Csq),
@@ -345,6 +491,16 @@ pub const CsqContext = struct {
 
     // Flushed records — populated by vbufFlush, consumed by the caller
     flushed_records: std.ArrayList(FlushedRecord) = .empty,
+
+    // Sample management
+    n_samples: u32,
+    /// Indices of selected samples (maps from 0..smpl_n to VCF sample column).
+    /// If null, all samples are used (identity mapping).
+    sample_indices: ?[]const u32,
+
+    // Cached genotype array (reused across csqStage calls for the same record)
+    gt_cache_rec: ?*const VcfRecord,
+    gt_cache: ?[]Genotype,
 
     // Options
     phase: Phase,
@@ -374,17 +530,27 @@ pub const CsqContext = struct {
         // ncsq2_max -> nfmt_bcsq: see ncsq2_to_nfmt in csq.c
         const nfmt = ncsq2ToNfmt(options.ncsq2_max);
 
+        const gencode = translate.findGeneticCode(options.gencode_id) orelse
+            translate.findGeneticCode(0).?;
+
         return CsqContext{
             .allocator = allocator,
             .gff = null,
+            .hap_ctx = HapContext.init(allocator, gencode),
             .fasta_fname = options.fasta_fname,
             .fai_ptr = options.fai_ptr,
             .fetch_seq_fn = options.fetch_seq_fn,
             .pos2vbuf = std.AutoHashMap(u32, usize).init(allocator),
             .vcf_rbuf = try RingBuffer(*Vbuf).init(allocator, 64),
+            .active_transcripts = ActiveTranscriptQueue.init(allocator, {}),
+            .rm_transcripts = .empty,
             .csq_buf = .empty,
             .output = .empty,
             .flushed_records = .empty,
+            .n_samples = options.n_samples,
+            .sample_indices = options.sample_indices,
+            .gt_cache_rec = null,
+            .gt_cache = null,
             .phase = options.phase,
             .local_csq = options.local_csq,
             .verbosity = options.verbosity,
@@ -418,6 +584,18 @@ pub const CsqContext = struct {
             if (fr.bcsq_value) |bv| self.allocator.free(bv);
         }
         self.flushed_records.deinit(self.allocator);
+        // Free cached genotypes
+        if (self.gt_cache) |gc| self.allocator.free(gc);
+        self.gt_cache = null;
+        self.gt_cache_rec = null;
+        // Clean up haplotype context
+        self.hap_ctx.deinit();
+        // Clean up any remaining transcripts in the removal list
+        for (self.rm_transcripts.items) |tr| {
+            self.destroyTranscriptAux(tr);
+        }
+        self.rm_transcripts.deinit(self.allocator);
+        self.active_transcripts.deinit();
     }
 
 
@@ -780,8 +958,11 @@ pub const CsqContext = struct {
         while (self.vcf_rbuf.len > 0) {
             const vbuf = self.vcf_rbuf.front().?;
 
-            // Cannot flush if transcript still active beyond this position
-            if (!self.local_csq and vbuf.keep_until > pos) break;
+            // Cannot flush if there are active transcripts and the vbuf's
+            // keep_until extends beyond the current position (C line 2721-2726)
+            if (!self.local_csq and self.active_transcripts.count() > 0) {
+                if (vbuf.keep_until > pos) break;
+            }
 
             _ = self.vcf_rbuf.shift();
 
@@ -825,8 +1006,13 @@ pub const CsqContext = struct {
             self.allocator.destroy(vbuf);
         }
 
-        // TODO: when active_transcripts heap is empty, clean up rm_transcripts
-        // (destroy haplotype trees, free reference sequences, etc.)
+        // When all active transcripts have been flushed, clean up the removal list
+        if (self.active_transcripts.count() == 0) {
+            for (self.rm_transcripts.items) |tr| {
+                self.destroyTranscriptAux(tr);
+            }
+            self.rm_transcripts.clearRetainingCapacity();
+        }
         self.csq_buf.clearRetainingCapacity();
     }
 
@@ -837,15 +1023,110 @@ pub const CsqContext = struct {
     /// Flush haplotypes for transcripts that end at or before `pos`.
     ///
     /// Port of hap_flush() from csq.c (line 2627).
-    /// TODO: requires active_transcripts min-heap and hap_finalize.
+    /// Pops transcripts from the active heap whose end <= pos, finalizes
+    /// their haplotype trees, stages per-sample VCF consequences, and
+    /// defers transcript cleanup until after vbufFlush.
     pub fn hapFlush(self: *CsqContext, pos: u32) !void {
-        _ = self;
-        _ = pos;
-        // TODO: while active_transcripts heap has transcripts ending <= pos:
-        //   1. Pop transcript from heap
-        //   2. Call hap_finalize to walk the haplotype tree and emit consequences
-        //   3. For VCF output with genotypes, call hap_stage_vcf per sample
-        //   4. Mark transcript for deferred cleanup in rm_transcripts
+        while (self.active_transcripts.count() > 0) {
+            const tr = self.active_transcripts.peek().?;
+            if (tr.end > pos) break;
+
+            // Pop the transcript with the smallest end position
+            _ = self.active_transcripts.remove();
+
+            // Point the haplotype context at this transcript
+            self.hap_ctx.tr = tr;
+
+            const taux: *Tscript = @ptrCast(@alignCast(tr.aux orelse {
+                // No aux data -- nothing to finalize, just mark for removal
+                try self.rm_transcripts.append(self.allocator, tr);
+                continue;
+            }));
+
+            const root = taux.root orelse {
+                try self.rm_transcripts.append(self.allocator, tr);
+                continue;
+            };
+
+            if (root.children.items.len > 0) {
+                // Finalize the haplotype tree: DFS traversal, translation,
+                // consequence determination for each leaf path
+                haplotype_mod.hapFinalize(&self.hap_ctx) catch |err| {
+                    std.log.warn("hapFinalize failed for transcript {d}: {}", .{ tr.id, err });
+                };
+
+                // Stage per-sample VCF consequences (unless DROP_GT mode)
+                if (self.phase != .drop_gt) {
+                    const n_smpl = self.n_samples;
+                    var i: u32 = 0;
+                    while (i < n_smpl) : (i += 1) {
+                        const ismpl: i32 = if (self.sample_indices) |idx|
+                            @intCast(idx[i])
+                        else
+                            @intCast(i);
+
+                        // Two haplotypes per sample
+                        if (taux.hap.items.len > i * 2) {
+                            self.hapStageVcf(ismpl, 0, taux.hap.items[i * 2]);
+                        }
+                        if (taux.hap.items.len > i * 2 + 1) {
+                            self.hapStageVcf(ismpl, 1, taux.hap.items[i * 2 + 1]);
+                        }
+                    }
+                }
+            }
+
+            // Mark transcript for deferred cleanup (cannot delete now because
+            // vbuf_flush still needs the transcript data for by-position output)
+            try self.rm_transcripts.append(self.allocator, tr);
+        }
+    }
+
+    /// Stage VCF consequence bitmask bits for a single sample/haplotype leaf node.
+    ///
+    /// Port of hap_stage_vcf() from csq.c (line 2597).
+    /// For each consequence in the leaf node's csq_list, sets the appropriate
+    /// bit in the vrec's fmt_bm array for this sample/haplotype pair.
+    fn hapStageVcf(self: *CsqContext, ismpl: i32, ihap: u1, node: *HapNode) void {
+        if (ismpl < 0) return;
+        if (node.csq_list.items.len == 0) return;
+
+        for (node.csq_list.items) |csq| {
+            // Each csq has a back-pointer to its vrec
+            const vrec_ptr = csq.vrec orelse continue;
+
+            const csq_idx = csq.idx;
+            const icsq2: u32 = @intCast(@as(i64, csq_idx) * 2 + @as(i64, ihap));
+
+            if (icsq2 >= self.ncsq2_max) {
+                // Too many consequences to fit in FORMAT field
+                break;
+            }
+
+            const ival: u32 = icsq2 / 30;
+            const ibit: u5 = @intCast(icsq2 % 30);
+            if (vrec_ptr.nfmt < 1 + ival) vrec_ptr.nfmt = @intCast(1 + ival);
+
+            // Set the bit: fmt_bm[ismpl * nfmt_bcsq + ival] |= (1 << ibit)
+            if (vrec_ptr.fmt_bm) |bm| {
+                const sample_u: usize = @intCast(ismpl);
+                const offset = sample_u * self.nfmt_bcsq + ival;
+                if (offset < bm.len) {
+                    bm[offset] |= @as(u32, 1) << ibit;
+                }
+            }
+        }
+    }
+
+    /// Convert a doubled consequence index to the (ival, ibit) pair for
+    /// indexing into the fmt_bm bitmask array.
+    ///
+    /// Port of icsq2_to_bit() from csq.c (line 585).
+    pub fn icsq2ToBit(icsq2: u32) struct { ival: u32, ibit: u5 } {
+        return .{
+            .ival = icsq2 / 30,
+            .ibit = @intCast(icsq2 % 30),
+        };
     }
 
     // -----------------------------------------------------------------
@@ -1000,7 +1281,7 @@ pub const CsqContext = struct {
                 };
                 // Build the spliced reference from CDS segments
                 self.tscriptSpliceRef(tr) catch {};
-                // TODO: add to active_transcripts heap
+                try self.active_transcripts.add(tr);
             }
 
             const taux_ptr: *Tscript = @ptrCast(@alignCast(tr.aux orelse continue));
@@ -1090,8 +1371,168 @@ pub const CsqContext = struct {
                 continue;
             }
 
-            // Full sample-aware haplotype extension requires htslib genotype access.
-            // TODO: implement bcf_get_genotypes loop per sample/haplotype
+            // ── Genotype-aware per-sample haplotype path ──────────────
+            // Port of C lines 3168-3288: iterate samples & haplotypes,
+            // extend the per-transcript haplotype tree for each non-ref allele.
+            const genotypes = rec.parseGenotypes(self.allocator) catch null;
+            if (genotypes == null) continue;
+            const gts = genotypes.?;
+            defer self.allocator.free(gts);
+
+            if (gts.len == 0) continue;
+
+            const ngts: u32 = gts[0].ploidy;
+            if (ngts != 1 and ngts != 2) {
+                // Non-haploid/diploid: skip (warn once)
+                if (self.verbosity > 0) {
+                    std.log.warn("Skipping site with non-diploid/non-haploid genotypes at {s}:{d}", .{ chr, rec.pos + 1 });
+                }
+                continue;
+            }
+
+            // Ensure the hap array is large enough: 2 * n_samples entries
+            const n_smpl = if (self.sample_indices) |si| @as(u32, @intCast(si.len)) else @as(u32, @intCast(gts.len));
+            const nhap_needed: usize = 2 * @as(usize, n_smpl);
+            while (taux_ptr.hap.items.len < nhap_needed) {
+                try taux_ptr.hap.append(self.allocator, taux_ptr.root orelse continue);
+            }
+            // Set root's nend to number of haplotypes
+            if (taux_ptr.root) |root_node| {
+                if (root_node.nend == 0) root_node.nend = @intCast(nhap_needed);
+            }
+
+            for (0..n_smpl) |ismpl_idx| {
+                const ismpl: usize = if (self.sample_indices) |si| @as(usize, si[ismpl_idx]) else ismpl_idx;
+                if (ismpl >= gts.len) continue;
+
+                var gt = gts[ismpl];
+                if (gt.alleles[0] < 0) continue; // first allele missing
+
+                // Handle unphased heterozygous
+                if (ngts > 1 and gt.alleles[1] >= 0 and gt.alleles[0] != gt.alleles[1]) {
+                    if (self.phase == .merge) {
+                        if (gt.alleles[0] == 0) gt.alleles[0] = gt.alleles[1];
+                    }
+                    if (!gt.phased) {
+                        switch (self.phase) {
+                            .require => return error.UnphasedHeterozygous,
+                            .skip => continue,
+                            .non_ref => {
+                                if (gt.alleles[0] == 0) {
+                                    gt.alleles[0] = gt.alleles[1];
+                                } else if (gt.alleles[1] == 0) {
+                                    gt.alleles[1] = gt.alleles[0];
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                }
+
+                var ihap: u32 = 0;
+                while (ihap < ngts) : (ihap += 1) {
+                    if (gt.alleles[ihap] <= 0) continue; // missing or ref
+                    const ial: u32 = @intCast(gt.alleles[ihap]);
+                    if (ial >= rec.n_allele) continue;
+                    if (ial >= rec.alleles.len) continue;
+
+                    const alt = rec.alleles[ial];
+                    if (alt.len > 0 and (alt[0] == '<' or alt[0] == '*')) continue;
+
+                    const i: usize = 2 * ismpl_idx + ihap;
+                    const root_ptr = taux_ptr.root orelse continue;
+                    const parent: *HapNode = if (i < taux_ptr.hap.items.len and taux_ptr.hap.items[i] != root_ptr)
+                        taux_ptr.hap.items[i]
+                    else
+                        root_ptr;
+
+                    // Check if this haplotype already seen for another sample at this record
+                    const rec_opaque: *const anyopaque = @ptrCast(rec);
+                    if (parent.cur_rec != null and parent.cur_rec.? == rec_opaque) {
+                        // Look up the cached child for this allele
+                        if (ial < parent.cur_child.items.len) {
+                            const cached_idx = parent.cur_child.items[ial];
+                            if (cached_idx >= 0 and @as(usize, @intCast(cached_idx)) < parent.children.items.len) {
+                                taux_ptr.hap.items[i] = parent.children.items[@intCast(cached_idx)];
+                                taux_ptr.hap.items[i].nend += 1;
+                                parent.nend -|= 1;
+                                continue;
+                            }
+                        }
+                    }
+
+                    var child = try self.allocator.create(HapNode);
+                    child.* = HapNode.init(.cds);
+                    const ref_allele = rec.alleles[0];
+
+                    const hap_ret = haplotype_mod.hapInit(
+                        self.allocator,
+                        parent,
+                        child,
+                        cds,
+                        rec.pos,
+                        ref_allele,
+                        alt,
+                        ial,
+                        taux_ptr,
+                    ) catch {
+                        self.allocator.destroy(child);
+                        continue;
+                    };
+
+                    switch (hap_ret) {
+                        .overlapping => {
+                            child.deinit(self.allocator);
+                            self.allocator.destroy(child);
+                            continue;
+                        },
+                        .discarded => {
+                            child.deinit(self.allocator);
+                            self.allocator.destroy(child);
+                            continue;
+                        },
+                        .added => {},
+                    }
+
+                    // Splice-only (HAP_SSS): stage the splice consequence directly
+                    if (child.payload == .sss) {
+                        var csq_sss = Csq{
+                            .pos = rec.pos,
+                            .vcsq = .{
+                                .csq_type = child.csq.toInt(),
+                                .biotype = @intFromEnum(tr.biotype),
+                                .strand = if (tr.strand == .forward) .fwd else .rev,
+                                .trid = tr.id,
+                                .vcf_ial = ial,
+                                .gene = if (tr.gene) |g| @as(?[]const u8, if (g.name) |n| std.mem.span(n) else null) else null,
+                            },
+                        };
+                        try self.csqStage(&csq_sss, rec);
+                        child.deinit(self.allocator);
+                        self.allocator.destroy(child);
+                        continue;
+                    }
+
+                    // Initialize cur_child tracking on the parent for this record
+                    if (parent.cur_rec == null or parent.cur_rec.? != rec_opaque) {
+                        parent.cur_child.clearRetainingCapacity();
+                        while (parent.cur_child.items.len < rec.n_allele) {
+                            try parent.cur_child.append(self.allocator, -1);
+                        }
+                        parent.cur_rec = rec_opaque;
+                    }
+
+                    // Attach child to parent in the haplotype tree
+                    const child_idx: i32 = @intCast(parent.children.items.len);
+                    if (ial < parent.cur_child.items.len) {
+                        parent.cur_child.items[ial] = child_idx;
+                    }
+                    try parent.children.append(self.allocator, child);
+                    taux_ptr.hap.items[i] = child;
+                    taux_ptr.hap.items[i].nend += 1;
+                    parent.nend -|= 1;
+                }
+            }
         }
         return ret;
     }
@@ -1141,7 +1582,7 @@ pub const CsqContext = struct {
                     else => return err,
                 };
                 self.tscriptSpliceRef(tr) catch {};
-                // TODO: add to active_transcripts heap
+                try self.active_transcripts.add(tr);
             }
 
             const taux: *Tscript = @ptrCast(@alignCast(tr.aux orelse continue));
@@ -1698,15 +2139,97 @@ pub const CsqContext = struct {
             return;
         }
 
-        // Genotype-aware sample assignment (requires htslib bcf_get_genotypes).
-        // TODO: When htslib bindings are available:
-        //   1. ngt = bcf_get_genotypes(hdr, rec, &gt_arr, &mgt_arr)
-        //   2. ngt /= bcf_hdr_nsamples(hdr)
-        //   3. if ngt <= 0: output with no sample, return
-        //   4. For tab output: iterate samples, check gt allele == vcf_ial,
-        //      call csq_print_text per matching sample/haplotype
-        //   5. For VCF output: iterate samples, for matching alleles set bits
-        //      in vrec.fmt_bm[sample * nfmt_bcsq + ival] |= (1 << ibit)
+        // Genotype-aware sample assignment.
+        // Port of csq_stage() from csq.c lines 3296-3358.
+
+        // Parse (or reuse cached) genotypes
+        var ngt: u32 = 0;
+        var gts: ?[]Genotype = null;
+
+        if (self.gt_cache_rec == rec and self.gt_cache != null) {
+            gts = self.gt_cache;
+        } else {
+            // Free previously cached genotypes
+            if (self.gt_cache) |gc| self.allocator.free(gc);
+            self.gt_cache = null;
+            self.gt_cache_rec = null;
+
+            gts = rec.parseGenotypes(self.allocator) catch null;
+            if (gts != null) {
+                self.gt_cache = gts;
+                self.gt_cache_rec = rec;
+            }
+        }
+
+        if (gts == null or gts.?.len == 0) {
+            // No genotypes: output with no sample (tab text mode would print here)
+            return;
+        }
+        const genotypes = gts.?;
+
+        ngt = genotypes[0].ploidy;
+        if (ngt == 0 or ngt > 2) return;
+
+        // VCF output: set bits in vrec.fmt_bm for matching samples
+        const n_smpl = if (self.sample_indices) |si| @as(u32, @intCast(si.len)) else @as(u32, @intCast(genotypes.len));
+        const csq_idx: u32 = if (csq.csq_idx) |ci| @intCast(ci) else return;
+
+        // Find the vrec for this consequence
+        const vrec_idx = csq.vrec_idx orelse return;
+        var vbuf: ?*Vbuf = null;
+        for (0..self.vcf_rbuf.len) |k| {
+            const candidate = self.vcf_rbuf.kth(k);
+            if (candidate.pos()) |p| {
+                if (p == csq.pos) {
+                    vbuf = candidate;
+                    break;
+                }
+            }
+        }
+        const vb = vbuf orelse return;
+        if (vrec_idx >= vb.vrecs.items.len) return;
+        var vrec = &vb.vrecs.items[vrec_idx];
+
+        // Ensure fmt_bm is allocated: n_smpl * nfmt_bcsq u32s
+        if (vrec.fmt_bm == null) {
+            const bm_size = n_smpl * self.nfmt_bcsq;
+            vrec.fmt_bm = try self.allocator.alloc(u32, bm_size);
+            @memset(vrec.fmt_bm.?, 0);
+        }
+
+        for (0..n_smpl) |ismpl_idx| {
+            const ismpl: usize = if (self.sample_indices) |si| @as(usize, si[ismpl_idx]) else ismpl_idx;
+            if (ismpl >= genotypes.len) continue;
+
+            const gt = genotypes[ismpl];
+
+            var j: u32 = 0;
+            while (j < ngt) : (j += 1) {
+                if (gt.alleles[j] <= 0) continue; // missing or ref
+                const ial: u32 = @intCast(gt.alleles[j]);
+                if (ial != csq.vcsq.vcf_ial) continue;
+
+                // icsq2 = 2 * csq_idx + haplotype (interleave first/second haplotype)
+                const icsq2: u32 = 2 * csq_idx + j;
+                if (icsq2 >= self.ncsq2_max) {
+                    if (self.verbosity > 0) {
+                        std.log.warn("Too many consequences at pos {d}, keeping first {d}", .{ csq.pos + 1, icsq2 + 1 });
+                    }
+                    break;
+                }
+
+                // Convert icsq2 to (ival, ibit) pair
+                const ival: u32 = icsq2 / 31;
+                const ibit: u5 = @intCast(icsq2 % 31);
+
+                if (vrec.nfmt < 1 + ival) vrec.nfmt = 1 + ival;
+
+                const bm_idx = @as(usize, ismpl_idx) * self.nfmt_bcsq + ival;
+                if (bm_idx < vrec.fmt_bm.?.len) {
+                    vrec.fmt_bm.?[bm_idx] |= @as(u32, 1) << ibit;
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------
@@ -1724,6 +2247,7 @@ pub const CsqContext = struct {
         VbufNotFound,
         VrecNotFound,
         OutOfMemory,
+        UnphasedHeterozygous,
     };
 };
 
@@ -2696,4 +3220,334 @@ test "injectBcsq: minimal line without FORMAT/samples" {
         "chr1\t100\t.\tA\tT\t.\tPASS\tBCSQ=missense|G||pc|+",
         result,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Genotype parsing tests
+// ---------------------------------------------------------------------------
+
+test "Genotype.parse: 0/1 -> alleles=[0,1], phased=false, ploidy=2" {
+    const gt = Genotype.parse("0/1");
+    try std.testing.expectEqual(@as(i32, 0), gt.alleles[0]);
+    try std.testing.expectEqual(@as(i32, 1), gt.alleles[1]);
+    try std.testing.expect(!gt.phased);
+    try std.testing.expectEqual(@as(u8, 2), gt.ploidy);
+}
+
+test "Genotype.parse: 1|0 -> alleles=[1,0], phased=true, ploidy=2" {
+    const gt = Genotype.parse("1|0");
+    try std.testing.expectEqual(@as(i32, 1), gt.alleles[0]);
+    try std.testing.expectEqual(@as(i32, 0), gt.alleles[1]);
+    try std.testing.expect(gt.phased);
+    try std.testing.expectEqual(@as(u8, 2), gt.ploidy);
+}
+
+test "Genotype.parse: ./. -> missing alleles" {
+    const gt = Genotype.parse("./.");
+    try std.testing.expectEqual(@as(i32, -1), gt.alleles[0]);
+    try std.testing.expectEqual(@as(i32, -1), gt.alleles[1]);
+    try std.testing.expectEqual(@as(u8, 2), gt.ploidy);
+}
+
+test "Genotype.parse: 0 -> haploid" {
+    const gt = Genotype.parse("0");
+    try std.testing.expectEqual(@as(i32, 0), gt.alleles[0]);
+    try std.testing.expectEqual(@as(i32, -1), gt.alleles[1]);
+    try std.testing.expectEqual(@as(u8, 1), gt.ploidy);
+}
+
+test "Genotype.parse: 1 -> haploid alt" {
+    const gt = Genotype.parse("1");
+    try std.testing.expectEqual(@as(i32, 1), gt.alleles[0]);
+    try std.testing.expectEqual(@as(i32, -1), gt.alleles[1]);
+    try std.testing.expectEqual(@as(u8, 1), gt.ploidy);
+}
+
+test "Genotype.parse: . -> missing haploid" {
+    const gt = Genotype.parse(".");
+    try std.testing.expectEqual(@as(i32, -1), gt.alleles[0]);
+    try std.testing.expectEqual(@as(u8, 1), gt.ploidy);
+}
+
+test "Genotype.parse: 0/2 -> multi-allelic" {
+    const gt = Genotype.parse("0/2");
+    try std.testing.expectEqual(@as(i32, 0), gt.alleles[0]);
+    try std.testing.expectEqual(@as(i32, 2), gt.alleles[1]);
+    try std.testing.expect(!gt.phased);
+}
+
+test "VcfRecord.parseGenotypes: two samples from raw VCF line" {
+    const allocator = std.testing.allocator;
+    const alleles = [_][]const u8{ "A", "T" };
+    const rec = VcfRecord{
+        .pos = 100,
+        .rid = 0,
+        .n_allele = 2,
+        .alleles = &alleles,
+        .rlen = 1,
+        .chr = "chr1",
+        .raw_line = "chr1\t101\t.\tA\tT\t.\tPASS\t.\tGT\t0/1\t1|0",
+    };
+    const gts = try rec.parseGenotypes(allocator);
+    try std.testing.expect(gts != null);
+    defer allocator.free(gts.?);
+
+    try std.testing.expectEqual(@as(usize, 2), gts.?.len);
+
+    // Sample 0: 0/1
+    try std.testing.expectEqual(@as(i32, 0), gts.?[0].alleles[0]);
+    try std.testing.expectEqual(@as(i32, 1), gts.?[0].alleles[1]);
+    try std.testing.expect(!gts.?[0].phased);
+
+    // Sample 1: 1|0
+    try std.testing.expectEqual(@as(i32, 1), gts.?[1].alleles[0]);
+    try std.testing.expectEqual(@as(i32, 0), gts.?[1].alleles[1]);
+    try std.testing.expect(gts.?[1].phased);
+}
+
+test "VcfRecord.parseGenotypes: no raw_line returns null" {
+    const allocator = std.testing.allocator;
+    const alleles = [_][]const u8{ "A", "T" };
+    const rec = VcfRecord{
+        .pos = 100,
+        .rid = 0,
+        .n_allele = 2,
+        .alleles = &alleles,
+        .rlen = 1,
+    };
+    const gts = try rec.parseGenotypes(allocator);
+    try std.testing.expect(gts == null);
+}
+
+test "testCds genotype-aware: two samples heterozygous get tree nodes" {
+    const allocator = std.testing.allocator;
+
+    const tgff = try makeTestGffWithRef(allocator);
+    defer destroyTestGffWithRef(allocator, tgff);
+
+    var ctx = try CsqContext.init(allocator, .{
+        .gff_fname = "test.gff",
+        .phase = .as_is, // allow unphased
+        .force = true,
+        .verbosity = 0,
+        .n_samples = 2,
+    });
+    defer ctx.deinit();
+    ctx.gff = tgff.gff;
+
+    // Two-sample VCF line with GT: sample 0 is 0/1, sample 1 is 1|0
+    const alleles = [_][]const u8{ "A", "T" };
+    var rec = VcfRecord{
+        .pos = 204,
+        .rid = 0,
+        .n_allele = 2,
+        .alleles = &alleles,
+        .rlen = 1,
+        .chr = "chr1",
+        .raw_line = "chr1\t205\t.\tA\tT\t.\tPASS\t.\tGT\t0/1\t1|0",
+    };
+
+    // Pre-set root nend to 4 (2 samples * 2 haplotypes) since we're not in drop_gt mode
+    const taux: *Tscript = @ptrCast(@alignCast(tgff.tr.aux orelse unreachable));
+    const root = taux.root.?;
+    root.nend = 4;
+
+    const vbuf = try ctx.vbufPush(&rec);
+    const hit = try ctx.testCds(&rec, vbuf);
+
+    try std.testing.expect(hit);
+
+    // The root should have at least one child node (both samples share same allele 1)
+    try std.testing.expect(root.children.items.len > 0);
+
+    // The child should be a CDS node
+    const child = root.children.items[0];
+    try std.testing.expect(child.payload == .cds);
+    try std.testing.expectEqual(@as(u32, 204), child.rbeg);
+
+    // At least some haplotypes should point to the child node
+    // Sample 0 hap[1] (second allele=1) and sample 1 hap[2] (first allele=1)
+    try std.testing.expect(taux.hap.items.len >= 4);
+
+    // Both haplotypes carrying alt allele should point to the same child
+    // (sharing optimization: second sample reuses the node from the first)
+    var alt_hap_count: u32 = 0;
+    for (taux.hap.items) |h| {
+        if (h == child) alt_hap_count += 1;
+    }
+    // At least 2 haplotypes should point to the child (one from each sample)
+    try std.testing.expect(alt_hap_count >= 2);
+}
+
+// ---------------------------------------------------------------------------
+// hapFlush tests
+// ---------------------------------------------------------------------------
+
+test "hapFlush: transcript ending before pos is flushed from active set" {
+    const allocator = std.testing.allocator;
+
+    var ctx = try CsqContext.init(allocator, .{
+        .gff_fname = "test.gff",
+        .phase = .drop_gt,
+        .local_csq = true,
+    });
+    defer ctx.deinit();
+
+    // Create a transcript ending at position 500
+    var tr = Transcript.init(allocator);
+    defer tr.deinit();
+    tr.id = 1;
+    tr.beg = 100;
+    tr.end = 500;
+    tr.strand = .forward;
+    tr.biotype = .protein_coding;
+
+    // Add to active transcripts
+    try ctx.active_transcripts.add(&tr);
+    try std.testing.expectEqual(@as(usize, 1), ctx.active_transcripts.count());
+
+    // Flush with pos=600 (past the transcript end)
+    try ctx.hapFlush(600);
+
+    // Transcript should have been removed from active set
+    try std.testing.expectEqual(@as(usize, 0), ctx.active_transcripts.count());
+
+    // And added to the removal list
+    try std.testing.expectEqual(@as(usize, 1), ctx.rm_transcripts.items.len);
+
+    // Clear rm_transcripts without destroying aux (there is none)
+    ctx.rm_transcripts.clearRetainingCapacity();
+}
+
+test "hapFlush: transcript ending after pos is NOT flushed" {
+    const allocator = std.testing.allocator;
+
+    var ctx = try CsqContext.init(allocator, .{
+        .gff_fname = "test.gff",
+        .phase = .drop_gt,
+        .local_csq = true,
+    });
+    defer ctx.deinit();
+
+    // Create a transcript ending at position 500
+    var tr = Transcript.init(allocator);
+    defer tr.deinit();
+    tr.id = 1;
+    tr.beg = 100;
+    tr.end = 500;
+    tr.strand = .forward;
+    tr.biotype = .protein_coding;
+
+    try ctx.active_transcripts.add(&tr);
+
+    // Flush with pos=300 (before the transcript end)
+    try ctx.hapFlush(300);
+
+    // Transcript should still be in the active set
+    try std.testing.expectEqual(@as(usize, 1), ctx.active_transcripts.count());
+    // Nothing in removal list
+    try std.testing.expectEqual(@as(usize, 0), ctx.rm_transcripts.items.len);
+}
+
+test "hapFlush: two transcripts flush in order of end position" {
+    const allocator = std.testing.allocator;
+
+    var ctx = try CsqContext.init(allocator, .{
+        .gff_fname = "test.gff",
+        .phase = .drop_gt,
+        .local_csq = true,
+    });
+    defer ctx.deinit();
+
+    // Transcript A ends at 400, transcript B ends at 600
+    var tr_a = Transcript.init(allocator);
+    defer tr_a.deinit();
+    tr_a.id = 1;
+    tr_a.beg = 100;
+    tr_a.end = 400;
+    tr_a.strand = .forward;
+    tr_a.biotype = .protein_coding;
+
+    var tr_b = Transcript.init(allocator);
+    defer tr_b.deinit();
+    tr_b.id = 2;
+    tr_b.beg = 200;
+    tr_b.end = 600;
+    tr_b.strand = .forward;
+    tr_b.biotype = .protein_coding;
+
+    // Add in reverse order to test heap ordering
+    try ctx.active_transcripts.add(&tr_b);
+    try ctx.active_transcripts.add(&tr_a);
+    try std.testing.expectEqual(@as(usize, 2), ctx.active_transcripts.count());
+
+    // Flush at pos=500: only tr_a (end=400) should be flushed
+    try ctx.hapFlush(500);
+
+    try std.testing.expectEqual(@as(usize, 1), ctx.active_transcripts.count());
+    try std.testing.expectEqual(@as(usize, 1), ctx.rm_transcripts.items.len);
+    try std.testing.expectEqual(@as(u32, 1), ctx.rm_transcripts.items[0].id); // tr_a
+
+    // Flush at pos=700: tr_b (end=600) should be flushed
+    try ctx.hapFlush(700);
+
+    try std.testing.expectEqual(@as(usize, 0), ctx.active_transcripts.count());
+    try std.testing.expectEqual(@as(usize, 2), ctx.rm_transcripts.items.len);
+    try std.testing.expectEqual(@as(u32, 2), ctx.rm_transcripts.items[1].id); // tr_b
+
+    // Clear rm_transcripts without destroying aux
+    ctx.rm_transcripts.clearRetainingCapacity();
+}
+
+test "hapFlush: POS_MAX drains all active transcripts" {
+    const allocator = std.testing.allocator;
+
+    var ctx = try CsqContext.init(allocator, .{
+        .gff_fname = "test.gff",
+        .phase = .drop_gt,
+        .local_csq = true,
+    });
+    defer ctx.deinit();
+
+    var tr1 = Transcript.init(allocator);
+    defer tr1.deinit();
+    tr1.id = 1;
+    tr1.beg = 0;
+    tr1.end = 100;
+    tr1.biotype = .protein_coding;
+
+    var tr2 = Transcript.init(allocator);
+    defer tr2.deinit();
+    tr2.id = 2;
+    tr2.beg = 50;
+    tr2.end = std.math.maxInt(u32) - 1;
+    tr2.biotype = .protein_coding;
+
+    try ctx.active_transcripts.add(&tr1);
+    try ctx.active_transcripts.add(&tr2);
+
+    try ctx.hapFlush(POS_MAX);
+
+    try std.testing.expectEqual(@as(usize, 0), ctx.active_transcripts.count());
+    try std.testing.expectEqual(@as(usize, 2), ctx.rm_transcripts.items.len);
+
+    ctx.rm_transcripts.clearRetainingCapacity();
+}
+
+test "icsq2ToBit: basic calculations" {
+    const r0 = CsqContext.icsq2ToBit(0);
+    try std.testing.expectEqual(@as(u32, 0), r0.ival);
+    try std.testing.expectEqual(@as(u5, 0), r0.ibit);
+
+    const r29 = CsqContext.icsq2ToBit(29);
+    try std.testing.expectEqual(@as(u32, 0), r29.ival);
+    try std.testing.expectEqual(@as(u5, 29), r29.ibit);
+
+    const r30 = CsqContext.icsq2ToBit(30);
+    try std.testing.expectEqual(@as(u32, 1), r30.ival);
+    try std.testing.expectEqual(@as(u5, 0), r30.ibit);
+
+    const r61 = CsqContext.icsq2ToBit(61);
+    try std.testing.expectEqual(@as(u32, 2), r61.ival);
+    try std.testing.expectEqual(@as(u5, 1), r61.ibit);
 }
