@@ -382,8 +382,15 @@ pub const Splice = struct {
 
         if (self.flags.set_refalt) {
             // Trim ref/alt and populate kref/kalt for downstream coding prediction.
-            self.vcf.rlen -= self.tbeg + self.tend;
-            self.vcf.alen -= self.tbeg + self.tend;
+            // The C code decrements tbeg by 1 if > 0 (C csq.c line 1432).
+            // This keeps one extra base of context, ensuring deletions have
+            // a non-empty kalt (e.g. TGGC>T → kref=TGGC, kalt=T instead of
+            // kref=GGC, kalt="").
+            if (self.tbeg > 0) self.tbeg -= 1;
+            if (self.vcf.rlen > self.tbeg + self.tend and self.vcf.alen > self.tbeg + self.tend) {
+                self.vcf.rlen -= self.tbeg + self.tend;
+                self.vcf.alen -= self.tbeg + self.tend;
+            }
             self.kref.clearRetainingCapacity();
             self.kalt.clearRetainingCapacity();
             const tbeg_u: usize = @intCast(self.tbeg);
@@ -626,8 +633,39 @@ pub const Splice = struct {
         }
 
         if (self.flags.set_refalt) {
-            // For deletions inside the exon, no splice_build_hap call in C code —
-            // the MNP-style trimming is used instead (handled by the caller).
+            // Trim ref/alt and populate kref/kalt (same logic as MNP path).
+            // C code: csq.c lines 1430-1449
+            if (self.tbeg > 0) self.tbeg -= 1;
+            if (self.vcf.rlen > self.tbeg + self.tend and self.vcf.alen > self.tbeg + self.tend) {
+                self.vcf.rlen -= self.tbeg + self.tend;
+                self.vcf.alen -= self.tbeg + self.tend;
+            }
+            self.kref.clearRetainingCapacity();
+            self.kalt.clearRetainingCapacity();
+            const tbeg_u: usize = @intCast(self.tbeg);
+            const rlen_u: usize = @intCast(self.vcf.rlen);
+            const alen_u: usize = @intCast(self.vcf.alen);
+            if (tbeg_u + rlen_u <= self.vcf.ref_allele.len) {
+                self.kref.appendSlice(self.allocator, self.vcf.ref_allele[tbeg_u .. tbeg_u + rlen_u]) catch {};
+            }
+            if (tbeg_u + alen_u <= self.vcf.alt_allele.len) {
+                self.kalt.appendSlice(self.allocator, self.vcf.alt_allele[tbeg_u .. tbeg_u + alen_u]) catch {};
+            }
+
+            // Check for overlap: deletion spans exon boundary (C lines 1440-1446)
+            if ((self.ref_beg + 1 < ex_beg and self.ref_end >= ex_beg) or
+                (self.ref_beg + 1 < ex_end and self.ref_end >= ex_end))
+            {
+                const ref_beg_adj: i64 = @as(i64, @intCast(self.ref_beg)) + @as(i64, @intCast(self.kalt.items.len)) - 1;
+                if (ref_beg_adj < @as(i64, @intCast(self.ref_end))) {
+                    const diff: u32 = self.ref_end - @as(u32, @intCast(ref_beg_adj));
+                    if (diff % 3 != 0)
+                        self.csq.frameshift_variant = true
+                    else
+                        self.csq.inframe_deletion = true;
+                }
+                return .overlap;
+            }
         }
 
         return .inside;

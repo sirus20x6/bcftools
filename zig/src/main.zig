@@ -441,6 +441,10 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
         if (tab_count >= 9) n_samples = tab_count - 8; // 9 tabs = 10 cols, 9 fixed + 1 sample
     }
 
+    // When there are no samples, force drop_gt mode (matches C: line 726)
+    var phase = opts.phase;
+    if (n_samples == 0) phase = .drop_gt;
+
     // ---- Open FASTA reference ----
     const fasta_z = blk: {
         var buf: [4096]u8 = undefined;
@@ -463,7 +467,7 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
     var csq_ctx = CsqContext.init(allocator, .{
         .gff_fname = opts.gff_fname.?,
         .fasta_fname = opts.fasta_fname.?,
-        .phase = opts.phase,
+        .phase = phase,
         .local_csq = opts.local_csq,
         .verbosity = 1,
         .force = opts.force,

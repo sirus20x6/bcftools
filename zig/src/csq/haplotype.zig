@@ -947,7 +947,7 @@ pub fn hapFinalize(ctx: *HapContext) !void {
                     },
                 };
                 // Build variant string in vstr
-                try buildVstr(allocator, &csq_entry.type_info.vstr, stack, ibeg_u, i, ctx, sref_len, seq_m, tr_ptr);
+                try buildVstr(allocator, &csq_entry.type_info.vstr, stack, ibeg_u, i, ctx, sref_len, seq_m, tr_ptr, csq_result.csq_type);
                 try child_node.csq_list.append(allocator, csq_entry);
 
                 // For compound variants (ibeg != iend), create CSQ_PRINTED_UPSTREAM
@@ -1072,7 +1072,7 @@ pub fn hapFinalize(ctx: *HapContext) !void {
                         .biotype = @intFromEnum(tr_ptr.biotype),
                     },
                 };
-                try buildVstr(allocator, &csq_entry.type_info.vstr, stack, i, ibeg_u, ctx, sref_len, seq_m, tr_ptr);
+                try buildVstr(allocator, &csq_entry.type_info.vstr, stack, i, ibeg_u, ctx, sref_len, seq_m, tr_ptr, csq_result.csq_type);
                 try child_node.csq_list.append(allocator, csq_entry);
 
                 // For compound variants (i != ibeg_u), create CSQ_PRINTED_UPSTREAM
@@ -1198,6 +1198,7 @@ fn buildVstr(
     sref_len: usize,
     seq_m: usize,
     tr: *const gff_types.Transcript,
+    csq_type: CsqType,
 ) !void {
     _ = seq_m;
 
@@ -1217,13 +1218,16 @@ fn buildVstr(
         try vstr.appendSlice(allocator, s);
     }
     try vstr.appendSlice(allocator, ctx.tref.items);
-    try vstr.append(allocator, '>');
-    {
-        var buf: [32]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "{d}", .{aa_rbeg}) catch return;
-        try vstr.appendSlice(allocator, s);
+    // For synonymous variants, omit the ">alt_aa" part (C: csq.c line 2285)
+    if (!csq_type.synonymous_variant) {
+        try vstr.append(allocator, '>');
+        {
+            var buf: [32]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "{d}", .{aa_rbeg}) catch return;
+            try vstr.appendSlice(allocator, s);
+        }
+        try vstr.appendSlice(allocator, ctx.tseq.items);
     }
-    try vstr.appendSlice(allocator, ctx.tseq.items);
     try vstr.append(allocator, '|');
 
     // DNA variant string: position + var for each node

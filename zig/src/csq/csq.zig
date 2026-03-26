@@ -1049,12 +1049,10 @@ pub const CsqContext = struct {
     ///
     /// Port of vbuf_flush() from csq.c (line 2715).
     pub fn vbufFlush(self: *CsqContext, pos: u32) !void {
-        // Free duped bcsq_value strings and fmt_bm from previous flush before clearing
-        for (self.flushed_records.items) |fr| {
-            if (fr.bcsq_value) |bv| self.allocator.free(bv);
-            if (fr.fmt_bm) |bm| self.allocator.free(bm);
-        }
-        self.flushed_records.clearRetainingCapacity();
+        // NOTE: Do NOT clear flushed_records here.  process() may call
+        // vbufFlush multiple times (e.g. chromosome-change flush followed
+        // by position-based flush) and the caller is responsible for
+        // consuming and clearing flushed_records between process() calls.
 
         while (self.vcf_rbuf.len > 0) {
             const vbuf = self.vcf_rbuf.front().?;
@@ -1293,6 +1291,10 @@ pub const CsqContext = struct {
         if (t & CSQ_SPLICE_REGION != 0 and t & (CSQ_SPLICE_DONOR | CSQ_SPLICE_ACCEPTOR) != 0) {
             t &= ~CSQ_SPLICE_REGION;
         }
+        // Remove stop_lost & synonymous if stop_retained set
+        if (t & CSQ_STOP_RETAINED != 0) t &= ~(CSQ_STOP_LOST | CSQ_SYNONYMOUS_VARIANT);
+        // Remove start_lost & synonymous if start_retained set
+        if (t & CSQ_START_RETAINED != 0) t &= ~(CSQ_START_LOST | CSQ_SYNONYMOUS_VARIANT);
         var masked_vcsq = vcsq;
         masked_vcsq.csq_type = t;
 
@@ -2362,11 +2364,31 @@ pub const CsqContext = struct {
             t = csq.vcsq.csq_type;
         }
 
+        // Remove stop_lost & synonymous if stop_retained set (C line 2059-2060)
+        if (t & CSQ_STOP_RETAINED != 0) {
+            t &= ~(CSQ_STOP_LOST | CSQ_SYNONYMOUS_VARIANT);
+            csq.vcsq.csq_type = t;
+        }
+        // Remove start_lost & synonymous if start_retained set (C line 2062-2063)
+        if (t & CSQ_START_RETAINED != 0) {
+            t &= ~(CSQ_START_LOST | CSQ_SYNONYMOUS_VARIANT);
+            csq.vcsq.csq_type = t;
+        }
+
         // Deduplication: scan existing consequences for a match
         for (vrec.vcsqs.items, 0..) |*existing, idx| {
             if (isDuplicate(existing, &csq.vcsq)) {
                 // Merge type bits into existing consequence
                 existing.csq_type |= t;
+
+                // Remove stop_lost & synonymous if stop_retained set (C line 2059-2060)
+                if (existing.csq_type & CSQ_STOP_RETAINED != 0)
+                    existing.csq_type &= ~(CSQ_STOP_LOST | CSQ_SYNONYMOUS_VARIANT);
+
+                // Remove start_lost & synonymous if start_retained set (C line 2062-2063)
+                if (existing.csq_type & CSQ_START_RETAINED != 0)
+                    existing.csq_type &= ~(CSQ_START_LOST | CSQ_SYNONYMOUS_VARIANT);
+
                 csq.vrec_idx = vi;
                 csq.csq_idx = idx;
                 return true; // duplicate

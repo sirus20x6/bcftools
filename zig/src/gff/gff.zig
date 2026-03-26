@@ -315,8 +315,11 @@ pub const GffParser = struct {
         const attrs_str = cols[8];
 
         // Parse begin/end (1-based in file -> 0-based internally)
-        const beg = (std.fmt.parseUnsigned(u32, beg_str, 10) catch return) -| 1;
-        const end = (std.fmt.parseUnsigned(u32, end_str, 10) catch return) -| 1;
+        // Use signed parse first to handle negative coordinates (clamp to 0).
+        const beg_signed = std.fmt.parseInt(i64, beg_str, 10) catch return;
+        const end_signed = std.fmt.parseInt(i64, end_str, 10) catch return;
+        const beg: u32 = if (beg_signed < 1) 0 else @intCast(@as(u64, @intCast(beg_signed)) -| 1);
+        const end: u32 = if (end_signed < 1) 0 else @intCast(@as(u64, @intCast(end_signed)) -| 1);
 
         // Parse strand
         const strand: Strand = if (strand_str.len > 0) switch (strand_str[0]) {
