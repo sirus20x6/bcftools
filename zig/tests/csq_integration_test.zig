@@ -272,7 +272,7 @@ test "CSQ pipeline context initialization and buffering" {
     const alloc = std.testing.allocator;
 
     var ctx = try csq.CsqContext.init(alloc, .{
-        .gff_fname = "dummy.gff3",
+        .gff_fname = "",
     });
     defer ctx.deinit();
 
@@ -423,7 +423,7 @@ test "pipeline smoke test - process records through CsqContext" {
     const alloc = std.testing.allocator;
 
     var ctx = try csq.CsqContext.init(alloc, .{
-        .gff_fname = "test.gff3",
+        .gff_fname = "",
         .phase = .as_is,
         .local_csq = true, // skip haplotype tree flushing for this test
     });

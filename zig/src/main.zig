@@ -172,6 +172,8 @@ fn buildCsqRecord(rec: *const VcfRecord) csq_mod.VcfRecord {
         .n_allele = count,
         .alleles = allele_scratch[0..count],
         .rlen = rec.rlen,
+        .chr = rec.chrom,
+        .raw_line = rec._storage,
     };
 }
 
@@ -280,17 +282,6 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
     }
 
     const allocator = std.heap.page_allocator;
-
-    // ---- Parse GFF annotations ----
-    var gff = GffParser.init(allocator);
-    defer gff.deinit();
-    gff.verbosity = if (opts.force) 0 else 1;
-    gff.force = opts.force;
-
-    gff.parse(opts.gff_fname.?) catch |err| {
-        std.debug.print("Error: failed to parse GFF file '{s}': {}\n", .{ opts.gff_fname.?, err });
-        std.process.exit(1);
-    };
 
     // ---- Open VCF input ----
     var reader = VcfReader.open(allocator, opts.input_fname.?) catch |err| {

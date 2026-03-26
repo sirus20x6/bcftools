@@ -179,17 +179,20 @@ pub const VcfRecord = struct {
     /// The underlying `chr` slice is expected to originate from a
     /// null-terminated source (e.g. VCF header seqname).  If it does
     /// not end with a sentinel zero we fall back to a comptime default.
+    /// Scratch buffer for null-terminated chromosome name.
+    var chr_z_buf: [256]u8 = undefined;
+
     pub fn chrZ(self: *const VcfRecord) [*:0]const u8 {
-        // Try to reinterpret the existing slice as sentinel-terminated.
-        // This works when chr came from std.mem.span on a [*:0]const u8
-        // because the sentinel byte sits right after chr.len.
-        if (self.chr.len > 0) {
-            const ptr = self.chr.ptr;
-            if (ptr[self.chr.len] == 0) {
-                return ptr[0..self.chr.len :0];
-            }
+        if (self.chr.len == 0) return "unknown";
+        // Try sentinel-terminated reinterpret first
+        if (self.chr.ptr[self.chr.len] == 0) {
+            return self.chr.ptr[0..self.chr.len :0];
         }
-        return "unknown";
+        // Fall back to copy into scratch buffer
+        const len = @min(self.chr.len, chr_z_buf.len - 1);
+        @memcpy(chr_z_buf[0..len], self.chr[0..len]);
+        chr_z_buf[len] = 0;
+        return chr_z_buf[0..len :0];
     }
 
     /// Parse genotypes from the raw VCF line for all samples.
@@ -433,7 +436,8 @@ pub const FaidxPtr = *anyopaque;
 pub const FetchSeqFn = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, chr: [*:0]const u8, beg: i64, end: i64) ?[]u8;
 
 pub const Options = struct {
-    gff_fname: []const u8,
+    gff_fname: []const u8 = "",
+    gff_ptr: ?*GffParser = null, // pre-built GFF parser (tests)
     fasta_fname: []const u8 = "",
     /// Opaque pointer to an opened HtsFaidx.  May be null when running without
     /// htslib (text-only testing path).
@@ -464,6 +468,7 @@ pub const CsqContext = struct {
 
     // GFF annotation — provides region indexes for CDS, UTR, exon, transcript lookups
     gff: ?*GffParser,
+    owns_gff: bool,
 
     // Haplotype processing
     hap_ctx: HapContext,
@@ -533,9 +538,25 @@ pub const CsqContext = struct {
         const gencode = translate.findGeneticCode(options.gencode_id) orelse
             translate.findGeneticCode(0).?;
 
+        // Parse GFF annotation file (skip if empty fname or pre-built gff provided)
+        var gff_ptr: ?*GffParser = options.gff_ptr;
+        var owns_gff = false;
+        if (gff_ptr == null and options.gff_fname.len > 0) {
+            const gff_obj = try allocator.create(GffParser);
+            gff_obj.* = GffParser.init(allocator);
+            gff_obj.parse(options.gff_fname) catch |e| {
+                allocator.destroy(gff_obj);
+                std.debug.print("Error: failed to parse GFF '{s}': {}\n", .{ options.gff_fname, e });
+                return e;
+            };
+            gff_ptr = gff_obj;
+            owns_gff = true;
+        }
+
         return CsqContext{
             .allocator = allocator,
-            .gff = null,
+            .gff = gff_ptr,
+            .owns_gff = owns_gff,
             .hap_ctx = HapContext.init(allocator, gencode),
             .fasta_fname = options.fasta_fname,
             .fai_ptr = options.fai_ptr,
@@ -596,6 +617,13 @@ pub const CsqContext = struct {
         }
         self.rm_transcripts.deinit(self.allocator);
         self.active_transcripts.deinit();
+        // Free the GFF parser (only if we created it)
+        if (self.owns_gff) {
+            if (self.gff) |g| {
+                g.deinit();
+                self.allocator.destroy(g);
+            }
+        }
     }
 
 
@@ -2361,7 +2389,7 @@ test "vbufPush: two records at same position share vbuf" {
     const allocator = std.testing.allocator;
 
     var ctx = try CsqContext.init(allocator, .{
-        .gff_fname = "test.gff",
+        .gff_fname = "",
         .phase = .drop_gt,
     });
     defer ctx.deinit();
@@ -2397,7 +2425,7 @@ test "vbufPush: records at different positions get separate vbufs" {
     const allocator = std.testing.allocator;
 
     var ctx = try CsqContext.init(allocator, .{
-        .gff_fname = "test.gff",
+        .gff_fname = "",
         .phase = .drop_gt,
     });
     defer ctx.deinit();
@@ -2434,7 +2462,7 @@ test "csqPush: dedup pushes same consequence only once" {
     const allocator = std.testing.allocator;
 
     var ctx = try CsqContext.init(allocator, .{
-        .gff_fname = "test.gff",
+        .gff_fname = "",
         .phase = .drop_gt,
     });
     defer ctx.deinit();
@@ -2487,7 +2515,7 @@ test "vbufFlush: flushes all records" {
     const allocator = std.testing.allocator;
 
     var ctx = try CsqContext.init(allocator, .{
-        .gff_fname = "test.gff",
+        .gff_fname = "",
         .phase = .drop_gt,
         .local_csq = true, // so keep_until is not checked against active transcripts
     });
@@ -2629,7 +2657,7 @@ test "testCds: variant overlapping CDS is detected" {
     defer destroyTestGff(allocator, tgff);
 
     var ctx = try CsqContext.init(allocator, .{
-        .gff_fname = "test.gff",
+        .gff_fname = "",
         .phase = .drop_gt,
         .force = true,
         .verbosity = 0,
@@ -2662,7 +2690,7 @@ test "testCds: variant outside CDS is not detected" {
     defer destroyTestGff(allocator, tgff);
 
     var ctx = try CsqContext.init(allocator, .{
-        .gff_fname = "test.gff",
+        .gff_fname = "",
         .phase = .drop_gt,
     });
     defer ctx.deinit();
@@ -2692,7 +2720,7 @@ test "testCdsLocal: variant overlapping CDS is detected (no fasta)" {
     defer destroyTestGff(allocator, tgff);
 
     var ctx = try CsqContext.init(allocator, .{
-        .gff_fname = "test.gff",
+        .gff_fname = "",
         .phase = .drop_gt,
         .local_csq = true,
         .force = true,
@@ -2728,7 +2756,7 @@ test "testUtr: variant in UTR5 region is detected" {
     defer destroyTestGff(allocator, tgff);
 
     var ctx = try CsqContext.init(allocator, .{
-        .gff_fname = "test.gff",
+        .gff_fname = "",
         .phase = .drop_gt,
     });
     defer ctx.deinit();
@@ -2764,7 +2792,7 @@ test "testTscript: intronic variant in coding transcript gets INTRON" {
     defer destroyTestGff(allocator, tgff);
 
     var ctx = try CsqContext.init(allocator, .{
-        .gff_fname = "test.gff",
+        .gff_fname = "",
         .phase = .drop_gt,
     });
     defer ctx.deinit();
@@ -2828,7 +2856,7 @@ test "testTscript: variant in non-coding transcript gets NON_CODING" {
     try gff.idx_tscript.insert("chr1", 100, 900, tr);
 
     var ctx = try CsqContext.init(allocator, .{
-        .gff_fname = "test.gff",
+        .gff_fname = "",
         .phase = .drop_gt,
     });
     defer ctx.deinit();
@@ -2862,7 +2890,7 @@ test "testSplice: variant near exon boundary sets splice consequence" {
     defer destroyTestGff(allocator, tgff);
 
     var ctx = try CsqContext.init(allocator, .{
-        .gff_fname = "test.gff",
+        .gff_fname = "",
         .phase = .drop_gt,
     });
     defer ctx.deinit();
@@ -2901,7 +2929,7 @@ test "testSplice: variant far from exon boundary has no splice consequence" {
     defer destroyTestGff(allocator, tgff);
 
     var ctx = try CsqContext.init(allocator, .{
-        .gff_fname = "test.gff",
+        .gff_fname = "",
         .phase = .drop_gt,
     });
     defer ctx.deinit();
@@ -2933,7 +2961,7 @@ test "process: full cascade CDS -> UTR -> splice -> tscript" {
     defer destroyTestGff(allocator, tgff);
 
     var ctx = try CsqContext.init(allocator, .{
-        .gff_fname = "test.gff",
+        .gff_fname = "",
         .phase = .drop_gt,
         .local_csq = true,
         .force = true,
@@ -3075,7 +3103,7 @@ test "testCdsLocal with ref: missense consequence for T>A at second codon positi
     defer destroyTestGffWithRef(allocator, tgff);
 
     var ctx = try CsqContext.init(allocator, .{
-        .gff_fname = "test.gff",
+        .gff_fname = "",
         .phase = .drop_gt,
         .local_csq = true,
         .force = true,
@@ -3118,7 +3146,7 @@ test "testCds DROP_GT: haplotype tree node created for CDS variant" {
     defer destroyTestGffWithRef(allocator, tgff);
 
     var ctx = try CsqContext.init(allocator, .{
-        .gff_fname = "test.gff",
+        .gff_fname = "",
         .phase = .drop_gt,
         .force = true,
         .verbosity = 0,
@@ -3326,7 +3354,7 @@ test "testCds genotype-aware: two samples heterozygous get tree nodes" {
     defer destroyTestGffWithRef(allocator, tgff);
 
     var ctx = try CsqContext.init(allocator, .{
-        .gff_fname = "test.gff",
+        .gff_fname = "",
         .phase = .as_is, // allow unphased
         .force = true,
         .verbosity = 0,
@@ -3387,7 +3415,7 @@ test "hapFlush: transcript ending before pos is flushed from active set" {
     const allocator = std.testing.allocator;
 
     var ctx = try CsqContext.init(allocator, .{
-        .gff_fname = "test.gff",
+        .gff_fname = "",
         .phase = .drop_gt,
         .local_csq = true,
     });
@@ -3423,7 +3451,7 @@ test "hapFlush: transcript ending after pos is NOT flushed" {
     const allocator = std.testing.allocator;
 
     var ctx = try CsqContext.init(allocator, .{
-        .gff_fname = "test.gff",
+        .gff_fname = "",
         .phase = .drop_gt,
         .local_csq = true,
     });
@@ -3453,7 +3481,7 @@ test "hapFlush: two transcripts flush in order of end position" {
     const allocator = std.testing.allocator;
 
     var ctx = try CsqContext.init(allocator, .{
-        .gff_fname = "test.gff",
+        .gff_fname = "",
         .phase = .drop_gt,
         .local_csq = true,
     });
@@ -3503,7 +3531,7 @@ test "hapFlush: POS_MAX drains all active transcripts" {
     const allocator = std.testing.allocator;
 
     var ctx = try CsqContext.init(allocator, .{
-        .gff_fname = "test.gff",
+        .gff_fname = "",
         .phase = .drop_gt,
         .local_csq = true,
     });
