@@ -291,7 +291,8 @@ test "CSQ pipeline context initialization and buffering" {
         .rlen = 1,
     };
 
-    const vbuf1 = try ctx.vbufPush(&rec1);
+    const r1 = try ctx.vbufPush(&rec1);
+    const vbuf1 = r1.vbuf;
     try std.testing.expectEqual(@as(usize, 1), vbuf1.vrecs.items.len);
 
     // Push another record at the same position — should go into the same vbuf
@@ -304,7 +305,8 @@ test "CSQ pipeline context initialization and buffering" {
         .rlen = 1,
     };
 
-    const vbuf2 = try ctx.vbufPush(&rec2);
+    const r2 = try ctx.vbufPush(&rec2);
+    const vbuf2 = r2.vbuf;
     try std.testing.expectEqual(@as(usize, 2), vbuf2.vrecs.items.len);
     // Same vbuf for same position
     try std.testing.expect(vbuf1 == vbuf2);
@@ -319,7 +321,8 @@ test "CSQ pipeline context initialization and buffering" {
         .rlen = 1,
     };
 
-    const vbuf3 = try ctx.vbufPush(&rec3);
+    const r3 = try ctx.vbufPush(&rec3);
+    const vbuf3 = r3.vbuf;
     try std.testing.expectEqual(@as(usize, 1), vbuf3.vrecs.items.len);
     try std.testing.expect(vbuf1 != vbuf3);
 

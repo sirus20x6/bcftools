@@ -643,9 +643,10 @@ pub const CsqContext = struct {
         self.pos2vbuf.deinit();
         self.csq_buf.deinit(self.allocator);
         self.output.deinit(self.allocator);
-        // Free any duped bcsq_value strings in flushed records
+        // Free any duped bcsq_value strings and fmt_bm in flushed records
         for (self.flushed_records.items) |fr| {
             if (fr.bcsq_value) |bv| self.allocator.free(bv);
+            if (fr.fmt_bm) |bm| self.allocator.free(bm);
         }
         self.flushed_records.deinit(self.allocator);
         // Free cached genotypes
@@ -966,7 +967,12 @@ pub const CsqContext = struct {
     /// Returns a pointer to the Vbuf containing the record.
     ///
     /// Port of vbuf_push() from csq.c (line 2675).
-    pub fn vbufPush(self: *CsqContext, rec: *const VcfRecord) !*Vbuf {
+    pub const VbufPushResult = struct {
+        vbuf: *Vbuf,
+        owned_rec: *const VcfRecord,
+    };
+
+    pub fn vbufPush(self: *CsqContext, rec: *const VcfRecord) !VbufPushResult {
         // Check if the last buffered vbuf has the same position
         const last_vbuf: ?*Vbuf = self.vcf_rbuf.last();
         const same_pos = if (last_vbuf) |vb| blk: {
@@ -1013,7 +1019,7 @@ pub const CsqContext = struct {
         // Register in pos2vbuf for O(1) existence check by position
         try self.pos2vbuf.put(rec.pos, 0);
 
-        return vbuf;
+        return .{ .vbuf = vbuf, .owned_rec = owned_rec };
     }
 
     // -----------------------------------------------------------------
@@ -1043,9 +1049,10 @@ pub const CsqContext = struct {
     ///
     /// Port of vbuf_flush() from csq.c (line 2715).
     pub fn vbufFlush(self: *CsqContext, pos: u32) !void {
-        // Free duped bcsq_value strings from previous flush before clearing
+        // Free duped bcsq_value strings and fmt_bm from previous flush before clearing
         for (self.flushed_records.items) |fr| {
             if (fr.bcsq_value) |bv| self.allocator.free(bv);
+            if (fr.fmt_bm) |bm| self.allocator.free(bm);
         }
         self.flushed_records.clearRetainingCapacity();
 
@@ -1100,6 +1107,9 @@ pub const CsqContext = struct {
                     .fmt_bm = vrec.fmt_bm,
                     .nfmt = vrec.nfmt,
                 });
+                // Transfer ownership of fmt_bm to the flushed record
+                // so that vrec.deinit() won't free it.
+                vrec.fmt_bm = null;
             }
 
             vbuf.deinit(self.allocator);
@@ -1205,9 +1215,14 @@ pub const CsqContext = struct {
         while (stack.items.len > 0) {
             const node = stack.pop() orelse break;
 
-            // Push children for further traversal
-            for (node.children.items) |child| {
-                try stack.append(self.allocator, child);
+            // Push children in reverse order so they pop in left-to-right order
+            // (matching the C code's istack-based DFS traversal).
+            {
+                var ci: usize = node.children.items.len;
+                while (ci > 0) {
+                    ci -= 1;
+                    try stack.append(self.allocator, node.children.items[ci]);
+                }
             }
 
             // Process consequences on this node
@@ -1222,6 +1237,7 @@ pub const CsqContext = struct {
                     .trid = csq_entry.type_info.trid,
                     .vcf_ial = csq_entry.type_info.vcf_ial,
                     .gene = csq_entry.type_info.gene,
+                    .ref_pos = csq_entry.ref_pos,
                     .vstr = if (csq_entry.type_info.vstr.items.len > 0)
                         csq_entry.type_info.vstr.items
                     else
@@ -1280,7 +1296,28 @@ pub const CsqContext = struct {
         var masked_vcsq = vcsq;
         masked_vcsq.csq_type = t;
 
-        // Deduplication: check if an identical consequence already exists
+        // Deduplication: special handling for CSQ_PRINTED_UPSTREAM (C csq.c lines 2018-2033)
+        if (t & CSQ_PRINTED_UPSTREAM != 0) {
+            for (vrec.vcsqs.items) |*existing| {
+                // START_STOP replaces START_STOP
+                if (t & CSQ_START_STOP != 0 and existing.csq_type & CSQ_START_STOP != 0) {
+                    existing.* = masked_vcsq;
+                    return;
+                }
+                // Only match existing PRINTED_UPSTREAM with same ref_pos
+                if (existing.csq_type & CSQ_PRINTED_UPSTREAM == 0) continue;
+                if (existing.ref_pos != null and masked_vcsq.ref_pos != null and
+                    existing.ref_pos.? == masked_vcsq.ref_pos.?)
+                {
+                    return; // duplicate
+                }
+            }
+            // Not a duplicate: append
+            try vrec.vcsqs.append(self.allocator, masked_vcsq);
+            return;
+        }
+
+        // Standard deduplication: check if an identical consequence already exists
         for (vrec.vcsqs.items) |*existing| {
             if (isDuplicate(existing, &masked_vcsq)) {
                 existing.csq_type |= t;
@@ -1295,30 +1332,73 @@ pub const CsqContext = struct {
     /// Stage VCF consequence bitmask bits for a single sample/haplotype leaf node.
     ///
     /// Port of hap_stage_vcf() from csq.c (line 2597).
-    /// For each consequence in the leaf node's csq_list, sets the appropriate
-    /// bit in the vrec's fmt_bm array for this sample/haplotype pair.
+    /// For each consequence in the leaf node's csq_list, find the matching
+    /// consequence in the pipeline vrec and set the appropriate bitmask bit.
     fn hapStageVcf(self: *CsqContext, ismpl: i32, ihap: u1, node: *HapNode) void {
         if (ismpl < 0) return;
         if (node.csq_list.items.len == 0) return;
 
         for (node.csq_list.items) |csq| {
-            // Each csq has a back-pointer to its vrec
-            const vrec_ptr = csq.vrec orelse continue;
+            // Find the pipeline vrec at this position
+            var target_vrec: ?*Vrec = null;
+            for (0..self.vcf_rbuf.len) |k| {
+                const candidate = self.vcf_rbuf.kth(k);
+                if (candidate.pos()) |p| {
+                    if (p == csq.pos) {
+                        if (candidate.vrecs.items.len > 0) {
+                            target_vrec = &candidate.vrecs.items[0];
+                        }
+                        break;
+                    }
+                }
+            }
+            const vrec = target_vrec orelse continue;
 
-            const csq_idx = csq.idx;
-            const icsq2: u32 = @intCast(@as(i64, csq_idx) * 2 + @as(i64, ihap));
-
-            if (icsq2 >= self.ncsq2_max) {
-                // Too many consequences to fit in FORMAT field
+            // Find the matching consequence index in the vrec's vcsqs list
+            const csq_type_raw = csq.type_info.csq_type.toInt();
+            var csq_idx: ?u32 = null;
+            for (vrec.vcsqs.items, 0..) |*vcsq, idx| {
+                // Match by type (including upstream_stop) and vstr
+                const existing_type = vcsq.csq_type;
+                // For PRINTED_UPSTREAM, match by ref_pos
+                if (csq_type_raw & CSQ_PRINTED_UPSTREAM != 0) {
+                    if (existing_type & CSQ_PRINTED_UPSTREAM != 0) {
+                        csq_idx = @intCast(idx);
+                        break;
+                    }
+                    continue;
+                }
+                // Match type bits (mask out printed_upstream for comparison)
+                const type_mask = ~CSQ_PRINTED_UPSTREAM;
+                if ((existing_type & type_mask) != (csq_type_raw & type_mask)) continue;
+                // Match vstr
+                const csq_vstr = if (csq.type_info.vstr.items.len > 0) csq.type_info.vstr.items else "";
+                const existing_vstr = vcsq.vstr orelse "";
+                if (!std.mem.eql(u8, csq_vstr, existing_vstr)) continue;
+                csq_idx = @intCast(idx);
                 break;
             }
 
+            const ci = csq_idx orelse continue;
+            const icsq2: u32 = ci * 2 + @as(u32, ihap);
+
+            if (icsq2 >= self.ncsq2_max) break;
+
             const ival: u32 = icsq2 / 30;
             const ibit: u5 = @intCast(icsq2 % 30);
-            if (vrec_ptr.nfmt < 1 + ival) vrec_ptr.nfmt = @intCast(1 + ival);
+            if (vrec.nfmt < 1 + ival) vrec.nfmt = 1 + ival;
 
-            // Set the bit: fmt_bm[ismpl * nfmt_bcsq + ival] |= (1 << ibit)
-            if (vrec_ptr.fmt_bm) |bm| {
+            // Allocate fmt_bm if needed
+            if (vrec.fmt_bm == null) {
+                const bm_size = self.n_samples * self.nfmt_bcsq;
+                if (bm_size > 0) {
+                    vrec.fmt_bm = self.allocator.alloc(u32, bm_size) catch continue;
+                    @memset(vrec.fmt_bm.?, 0);
+                }
+            }
+
+            // Set the bit
+            if (vrec.fmt_bm) |bm| {
                 const sample_u: usize = @intCast(ismpl);
                 const offset = sample_u * self.nfmt_bcsq + ival;
                 if (offset < bm.len) {
@@ -1387,7 +1467,12 @@ pub const CsqContext = struct {
         }
         self.current_rid = rec.rid;
 
-        const vbuf = try self.vbufPush(rec);
+        const push_result = try self.vbufPush(rec);
+        const vbuf = push_result.vbuf;
+        // Use the heap-owned record for haplotype tree identity checks.
+        // The caller's `rec` may be a stack variable reused across calls,
+        // so pointer identity wouldn't distinguish different records.
+        const owned_rec = push_result.owned_rec;
 
         // Check for symbolic ALTs
         if (rec.alleles.len >= 2 and rec.alleles[1].len > 0 and rec.alleles[1][0] == '<') {
@@ -1398,7 +1483,7 @@ pub const CsqContext = struct {
             if (self.local_csq) {
                 hit = try self.testCdsLocal(rec);
             } else {
-                hit = try self.testCds(rec, vbuf);
+                hit = try self.testCds(owned_rec, vbuf);
             }
             if (!hit) {
                 const utr_hit = try self.testUtr(rec);
@@ -1467,7 +1552,7 @@ pub const CsqContext = struct {
                 const root = try self.allocator.create(HapNode);
                 root.* = HapNode.init(.root);
                 taux.root = root;
-                const nhap: u32 = if (self.phase == .drop_gt) 1 else 2;
+                const nhap: u32 = if (self.phase == .drop_gt) 1 else 2 * self.n_samples;
                 root.nend = nhap;
                 // Fetch the FASTA reference for this transcript (if faidx available)
                 self.tscriptInitRef(tr, rec.chrZ()) catch |err| switch (err) {
@@ -1606,10 +1691,9 @@ pub const CsqContext = struct {
             while (taux_ptr.hap.items.len < nhap_needed) {
                 try taux_ptr.hap.append(self.allocator, taux_ptr.root orelse continue);
             }
-            // Set root's nend to number of haplotypes
-            if (taux_ptr.root) |root_node| {
-                if (root_node.nend == 0) root_node.nend = @intCast(nhap_needed);
-            }
+            // Note: root.nend is initialized at transcript creation (nhap = 2 * n_samples)
+            // and should NOT be re-initialized here, as haplotypes may have already
+            // moved from root to child nodes, decrementing root.nend correctly.
 
             for (0..n_smpl) |ismpl_idx| {
                 const ismpl: usize = if (self.sample_indices) |si| @as(usize, si[ismpl_idx]) else ismpl_idx;
@@ -1740,6 +1824,7 @@ pub const CsqContext = struct {
                     try parent.children.append(self.allocator, child);
                     taux_ptr.hap.items[i] = child;
                     taux_ptr.hap.items[i].nend += 1;
+                    parent.nend -|= 1;
                     parent.nend -|= 1;
                 }
             }
@@ -2304,10 +2389,12 @@ pub const CsqContext = struct {
 
         if (existing.biotype != new.biotype) return false;
 
-        // For compound consequences, also check gene, vcf_ial, and vstr
+        // For compound consequences, also check gene, vcf_ial, upstream_stop, and vstr
         if (new.csq_type & CSQ_COMPOUND != 0) {
             if (!strEql(existing.gene, new.gene)) return false;
             if (existing.vcf_ial != new.vcf_ial) return false;
+            // Both must or mustn't have upstream_stop (C line 2043)
+            if ((existing.csq_type & CSQ_UPSTREAM_STOP) ^ (new.csq_type & CSQ_UPSTREAM_STOP) != 0) return false;
 
             // Both have vstr: must match
             if (existing.vstr != null and new.vstr != null) {
@@ -2596,13 +2683,13 @@ test "vbufPush: two records at same position share vbuf" {
         .rlen = 1,
     };
 
-    const vbuf1 = try ctx.vbufPush(&rec1);
-    const vbuf2 = try ctx.vbufPush(&rec2);
+    const r1 = try ctx.vbufPush(&rec1);
+    const r2 = try ctx.vbufPush(&rec2);
 
     // Both should return the same vbuf
-    try std.testing.expectEqual(vbuf1, vbuf2);
+    try std.testing.expectEqual(r1.vbuf, r2.vbuf);
     // The vbuf should contain 2 records
-    try std.testing.expectEqual(@as(usize, 2), vbuf1.vrecs.items.len);
+    try std.testing.expectEqual(@as(usize, 2), r1.vbuf.vrecs.items.len);
     // Ring buffer should have exactly 1 entry
     try std.testing.expectEqual(@as(usize, 1), ctx.vcf_rbuf.len);
 }
@@ -2632,14 +2719,14 @@ test "vbufPush: records at different positions get separate vbufs" {
         .rlen = 1,
     };
 
-    const vbuf1 = try ctx.vbufPush(&rec1);
-    const vbuf2 = try ctx.vbufPush(&rec2);
+    const r1 = try ctx.vbufPush(&rec1);
+    const r2 = try ctx.vbufPush(&rec2);
 
     // Should be different vbufs
-    try std.testing.expect(vbuf1 != vbuf2);
+    try std.testing.expect(r1.vbuf != r2.vbuf);
     // Each should have 1 record
-    try std.testing.expectEqual(@as(usize, 1), vbuf1.vrecs.items.len);
-    try std.testing.expectEqual(@as(usize, 1), vbuf2.vrecs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), r1.vbuf.vrecs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), r2.vbuf.vrecs.items.len);
     // Ring buffer should have 2 entries
     try std.testing.expectEqual(@as(usize, 2), ctx.vcf_rbuf.len);
 }
@@ -2861,7 +2948,7 @@ test "testCds: variant overlapping CDS is detected" {
         .chr = "chr1",
     };
 
-    const vbuf = try ctx.vbufPush(&rec);
+    const vbuf = (try ctx.vbufPush(&rec)).vbuf;
     const hit = try ctx.testCds(&rec, vbuf);
 
     try std.testing.expect(hit);
@@ -2893,7 +2980,7 @@ test "testCds: variant outside CDS is not detected" {
         .chr = "chr1",
     };
 
-    const vbuf = try ctx.vbufPush(&rec);
+    const vbuf = (try ctx.vbufPush(&rec)).vbuf;
     const hit = try ctx.testCds(&rec, vbuf);
 
     try std.testing.expect(!hit);
@@ -3352,7 +3439,7 @@ test "testCds DROP_GT: haplotype tree node created for CDS variant" {
         .chr = "chr1",
     };
 
-    const vbuf = try ctx.vbufPush(&rec);
+    const vbuf = (try ctx.vbufPush(&rec)).vbuf;
     const hit = try ctx.testCds(&rec, vbuf);
 
     try std.testing.expect(hit);
@@ -3566,7 +3653,7 @@ test "testCds genotype-aware: two samples heterozygous get tree nodes" {
     const root = taux.root.?;
     root.nend = 4;
 
-    const vbuf = try ctx.vbufPush(&rec);
+    const vbuf = (try ctx.vbufPush(&rec)).vbuf;
     const hit = try ctx.testCds(&rec, vbuf);
 
     try std.testing.expect(hit);

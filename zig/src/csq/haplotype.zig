@@ -950,6 +950,38 @@ pub fn hapFinalize(ctx: *HapContext) !void {
                 try buildVstr(allocator, &csq_entry.type_info.vstr, stack, ibeg_u, i, ctx, sref_len, seq_m, tr_ptr);
                 try child_node.csq_list.append(allocator, csq_entry);
 
+                // For compound variants (ibeg != iend), create CSQ_PRINTED_UPSTREAM
+                // entries at non-ref-node positions (C csq.c lines 2334-2370).
+                // ref_node = ibeg for forward strand.
+                if (ibeg_u != i) {
+                    const ref_node_pos_1based: u32 = stack[ibeg_u].node.?.rbeg + 1;
+                    var j: usize = ibeg_u;
+                    while (j <= i) : (j += 1) {
+                        if (j == ibeg_u) continue; // skip ref_node
+                        const node_j = stack[j].node.?;
+                        // Create CSQ_PRINTED_UPSTREAM entry
+                        var upstream_csq = types.CsqType{};
+                        upstream_csq.printed_upstream = true;
+                        // Also include the node's own CSQ bits
+                        const node_csq_raw = node_j.csq.toInt();
+                        upstream_csq = types.CsqType.fromInt(upstream_csq.toInt() | node_csq_raw);
+                        const upstream_entry: types.Csq = .{
+                            .pos = node_j.rbeg,
+                            .ref_pos = ref_node_pos_1based,
+                            .type_info = .{
+                                .csq_type = upstream_csq,
+                                .trid = tr_ptr.id,
+                                .gene = if (tr_ptr.gene) |g| blk: {
+                                    break :blk if (g.name) |n| std.mem.span(n) else null;
+                                } else null,
+                                .strand = tr_ptr.strand == .forward,
+                                .biotype = @intFromEnum(tr_ptr.biotype),
+                            },
+                        };
+                        try child_node.csq_list.append(allocator, upstream_entry);
+                    }
+                }
+
                 ibeg_s = -1;
                 dlen_acc = 0;
                 indel_flag = false;
@@ -1042,6 +1074,36 @@ pub fn hapFinalize(ctx: *HapContext) !void {
                 };
                 try buildVstr(allocator, &csq_entry.type_info.vstr, stack, i, ibeg_u, ctx, sref_len, seq_m, tr_ptr);
                 try child_node.csq_list.append(allocator, csq_entry);
+
+                // For compound variants (i != ibeg_u), create CSQ_PRINTED_UPSTREAM
+                // entries at non-ref-node positions (C csq.c lines 2334-2370).
+                // ref_node = iend = ibeg_u for reverse strand.
+                if (i != ibeg_u) {
+                    const ref_node_pos_1based: u32 = stack[ibeg_u].node.?.rbeg + 1;
+                    var j: usize = i;
+                    while (j <= ibeg_u) : (j += 1) {
+                        if (j == ibeg_u) continue; // skip ref_node
+                        const node_j = stack[j].node.?;
+                        var upstream_csq = types.CsqType{};
+                        upstream_csq.printed_upstream = true;
+                        const node_csq_raw = node_j.csq.toInt();
+                        upstream_csq = types.CsqType.fromInt(upstream_csq.toInt() | node_csq_raw);
+                        const upstream_entry: types.Csq = .{
+                            .pos = node_j.rbeg,
+                            .ref_pos = ref_node_pos_1based,
+                            .type_info = .{
+                                .csq_type = upstream_csq,
+                                .trid = tr_ptr.id,
+                                .gene = if (tr_ptr.gene) |g| blk: {
+                                    break :blk if (g.name) |n| std.mem.span(n) else null;
+                                } else null,
+                                .strand = tr_ptr.strand == .forward,
+                                .biotype = @intFromEnum(tr_ptr.biotype),
+                            },
+                        };
+                        try child_node.csq_list.append(allocator, upstream_entry);
+                    }
+                }
 
                 ibeg_s = -1;
                 dlen_acc = 0;

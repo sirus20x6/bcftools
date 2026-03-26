@@ -234,6 +234,8 @@ pub const Csq = struct {
     vrec: ?*Vrec = null,
     idx: i32 = 0,
     type_info: Vcsq = .{},
+    /// For CSQ_PRINTED_UPSTREAM: the 1-based position of the upstream reference record.
+    ref_pos: ?u32 = null,
 
     pub fn deinit(self: *Csq, allocator: Allocator) void {
         self.type_info.deinit(allocator);

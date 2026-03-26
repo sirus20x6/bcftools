@@ -184,22 +184,116 @@ fn buildCsqRecord(rec: *const VcfRecord) csq_mod.VcfRecord {
 /// Write a single VCF line to output.  If `bcsq_value` is non-null the
 /// annotation is injected into the INFO column (column 7); otherwise the
 /// original line is written unchanged.
+/// If `fmt_bm` is non-null, also append `:BCSQ` to FORMAT and bitmask values
+/// to each sample column.
 fn writeVcfLine(
     allocator: std.mem.Allocator,
     out: std.fs.File,
     original_line: []const u8,
     bcsq_value: ?[]const u8,
     bcsq_tag: []const u8,
+    fmt_bm: ?[]const u32,
+    nfmt: u32,
+    n_samples: u32,
 ) !void {
+    var line_to_process = original_line;
+    var info_modified: ?[]u8 = null;
+    defer if (info_modified) |m| allocator.free(m);
+
     if (bcsq_value) |val| {
-        const modified = try csq_mod.injectBcsq(allocator, original_line, val, bcsq_tag);
-        defer allocator.free(modified);
-        try out.writeAll(modified);
-        try out.writeAll("\n");
-    } else {
-        try out.writeAll(original_line);
-        try out.writeAll("\n");
+        info_modified = try csq_mod.injectBcsq(allocator, original_line, val, bcsq_tag);
+        line_to_process = info_modified.?;
     }
+
+    if (fmt_bm != null and n_samples > 0 and nfmt > 0) {
+        const bm = fmt_bm.?;
+        // Parse columns to find FORMAT (col 8) and sample columns (col 9+)
+        // We need to:
+        // 1. Append ":BCSQ_TAG" to the FORMAT column
+        // 2. Append ":<bitmask>" to each sample column
+
+        // Strip trailing newline/CR
+        var line = line_to_process;
+        if (line.len > 0 and line[line.len - 1] == '\n') line = line[0 .. line.len - 1];
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+
+        // Find column boundaries
+        var col_starts: [256]usize = undefined;
+        var col_count: usize = 0;
+        var start: usize = 0;
+        for (line, 0..) |c, idx| {
+            if (c == '\t') {
+                if (col_count < col_starts.len) {
+                    col_starts[col_count] = start;
+                    col_count += 1;
+                }
+                start = idx + 1;
+            }
+        }
+        // Last column
+        if (col_count < col_starts.len) {
+            col_starts[col_count] = start;
+            col_count += 1;
+        }
+
+        if (col_count >= 10) {
+            // We have FORMAT (col 8, index 8) and at least one sample
+            var result: std.ArrayList(u8) = .empty;
+            defer result.deinit(allocator);
+
+            // Write columns 0-7 unchanged (CHROM through INFO)
+            const fmt_col_start = col_starts[8];
+            try result.appendSlice(allocator, line[0..fmt_col_start]);
+
+            // Find FORMAT column end
+            const fmt_end = blk: {
+                var e = fmt_col_start;
+                while (e < line.len and line[e] != '\t') e += 1;
+                break :blk e;
+            };
+            // Append FORMAT field + ":BCSQ"
+            try result.appendSlice(allocator, line[fmt_col_start..fmt_end]);
+            try result.append(allocator, ':');
+            try result.appendSlice(allocator, bcsq_tag);
+
+            // For each sample column, append ":<bitmask>"
+            const nfmt_bcsq: usize = @max(1, nfmt);
+            var smpl_idx: u32 = 0;
+            var pos_s: usize = fmt_end;
+            while (smpl_idx < n_samples) : (smpl_idx += 1) {
+                // Find sample column boundaries
+                if (pos_s < line.len and line[pos_s] == '\t') {
+                    pos_s += 1; // skip tab
+                }
+                var smpl_end = pos_s;
+                while (smpl_end < line.len and line[smpl_end] != '\t') smpl_end += 1;
+
+                try result.append(allocator, '\t');
+                try result.appendSlice(allocator, line[pos_s..smpl_end]);
+                try result.append(allocator, ':');
+
+                // Write bitmask value(s) for this sample
+                const bm_offset = @as(usize, smpl_idx) * nfmt_bcsq;
+                var fi: usize = 0;
+                while (fi < nfmt_bcsq) : (fi += 1) {
+                    if (fi > 0) try result.append(allocator, ',');
+                    const val = if (bm_offset + fi < bm.len) bm[bm_offset + fi] else 0;
+                    var buf: [16]u8 = undefined;
+                    const s = std.fmt.bufPrint(&buf, "{d}", .{val}) catch break;
+                    try result.appendSlice(allocator, s);
+                }
+
+                pos_s = smpl_end;
+            }
+
+            try out.writeAll(result.items);
+            try out.writeAll("\n");
+            return;
+        }
+    }
+
+    try out.writeAll(line_to_process);
+    try out.writeAll("\n");
 }
 
 /// Drain flushed records from the CSQ context and write them to output.
@@ -220,10 +314,11 @@ fn writeFlushedRecords(
         const key = posKey(fr.rid, fr.pos);
         const original_line = line_map.get(key) orelse continue;
 
-        try writeVcfLine(allocator, out, original_line, fr.bcsq_value, csq_ctx.bcsq_tag);
+        try writeVcfLine(allocator, out, original_line, fr.bcsq_value, csq_ctx.bcsq_tag, fr.fmt_bm, fr.nfmt, csq_ctx.n_samples);
 
-        // Free the duped bcsq_value string
+        // Free the duped bcsq_value string and fmt_bm
         if (fr.bcsq_value) |bv| allocator.free(bv);
+        if (fr.fmt_bm) |bm| allocator.free(bm);
 
         // Remove from map to free memory
         _ = line_map.remove(key);
@@ -333,10 +428,17 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
     out_file.writeAll(opts.custom_tag) catch {};
     out_file.writeAll(" tag\">\n") catch {};
 
-    // Write the #CHROM line
+    // Write the #CHROM line and count samples
+    var n_samples: u32 = 0;
     if (chrom_line) |cl| {
         out_file.writeAll(cl) catch {};
         out_file.writeAll("\n") catch {};
+        // Count samples: #CHROM has 9 fixed columns, then samples
+        var tab_count: u32 = 0;
+        for (cl) |c| {
+            if (c == '\t') tab_count += 1;
+        }
+        if (tab_count >= 9) n_samples = tab_count - 8; // 9 tabs = 10 cols, 9 fixed + 1 sample
     }
 
     // ---- Open FASTA reference ----
@@ -368,6 +470,7 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
         .bcsq_tag = opts.custom_tag,
         .ncsq2_max = opts.ncsq * 2,
         .brief_predictions = opts.brief_predictions,
+        .n_samples = n_samples,
         .fai_ptr = @ptrCast(&fai),
         .fetch_seq_fn = &htsFaidxFetchAdapter,
     }) catch |err| {
