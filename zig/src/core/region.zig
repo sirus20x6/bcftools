@@ -78,10 +78,13 @@ pub fn RegionIndex(comptime Payload: type) type {
         pub fn overlap(self: *Self, seq: []const u8, beg: u32, end: u32) OverlapIterator {
             if (!self.sorted) self.sort();
             const intervals = if (self.sequences.get(seq)) |list| list.items else &[_]Interval{};
-            const start = lowerBound(intervals, beg);
+            // Start from 0 because intervals sorted by beg don't have monotonic
+            // end values — a binary search on end can miss earlier intervals whose
+            // beg is small but end extends past the query start.  The iterator's
+            // beg > query_end check still provides an early exit.
             return .{
                 .intervals = intervals,
-                .idx = start,
+                .idx = 0,
                 .query_beg = beg,
                 .query_end = end,
             };

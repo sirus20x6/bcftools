@@ -385,12 +385,9 @@ pub const Splice = struct {
         self.checkExonEnd(ex_end, n_splice_region_exon);
 
         if (self.flags.set_refalt) {
-            // Trim ref/alt and populate kref/kalt for downstream coding prediction.
-            // The C code decrements tbeg by 1 if > 0 (C csq.c line 1432).
-            // This keeps one extra base of context, ensuring deletions have
-            // a non-empty kalt (e.g. TGGC>T → kref=TGGC, kalt=T instead of
-            // kref=GGC, kalt="").
-            if (self.tbeg > 0) self.tbeg -= 1;
+            // For MNPs, do NOT decrement tbeg (unlike del/ins which add a
+            // context base via tbeg-- in C csq.c lines 1212/1432).  The C
+            // splice_csq_mnp (line 1549) simply trims by tbeg+tend.
             if (self.vcf.rlen > self.tbeg + self.tend and self.vcf.alen > self.tbeg + self.tend) {
                 self.vcf.rlen -= self.tbeg + self.tend;
                 self.vcf.alen -= self.tbeg + self.tend;

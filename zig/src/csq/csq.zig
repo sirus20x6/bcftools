@@ -1056,17 +1056,25 @@ pub const CsqContext = struct {
     }
 
     fn vcsqSortKey(v: Vcsq) u3 {
-        if (v.csq_type & CSQ_PRINTED_UPSTREAM != 0) return 0;
-        // Splice-only consequences (no CDS overlap) — these are staged first in C
+        // Match C's output order: non-CDS consequences first (pushed during
+        // process by testUtr/testSplice/testTscript), then CDS consequences
+        // (appended later by hapFlush/transferTreeCsqToVbuf).
+        // Splice-only consequences (no CDS overlap) — pushed first by testSplice
         if (v.csq_type & (CSQ_SPLICE_ACCEPTOR | CSQ_SPLICE_DONOR | CSQ_SPLICE_REGION) != 0 and
             v.csq_type & CSQ_COMPOUND == 0)
-            return 1;
-        // Compound (CDS-level) consequences
-        if (v.csq_type & CSQ_COMPOUND != 0) return 2;
-        // Non-coding/intron
-        if (v.csq_type & (CSQ_INTRON | CSQ_NON_CODING) != 0) return 4;
-        // UTR and other non-compound
-        return 3;
+            return 0;
+        // UTR — pushed by testUtr
+        if (v.csq_type & (CSQ_UTR5 | CSQ_UTR3) != 0) return 1;
+        // Non-coding/intron — pushed by testTscript
+        if (v.csq_type & (CSQ_INTRON | CSQ_NON_CODING) != 0) return 2;
+        // CDS-level consequences (compound or start/stop retained) — from hapFlush
+        if (v.csq_type & CSQ_COMPOUND != 0 or
+            v.csq_type & (CSQ_START_RETAINED | CSQ_STOP_RETAINED) != 0)
+            return 3;
+        // PRINTED_UPSTREAM back-references — after the consequence they reference
+        if (v.csq_type & CSQ_PRINTED_UPSTREAM != 0) return 4;
+        // Everything else
+        return 5;
     }
 
     /// Flush all buffered VCF records whose keep_until <= pos.
@@ -1108,9 +1116,10 @@ pub const CsqContext = struct {
                     continue;
                 }
 
-                // Sort consequences: compound (CDS-level) before non-compound
-                // (UTR, intron, splice-only). This matches the C code's output
-                // order where CDS consequences appear before UTR consequences.
+                // Sort consequences: non-compound (UTR, intron, splice-only)
+                // before compound (CDS-level). This matches C's output order
+                // where non-CDS consequences are pushed first during process(),
+                // and CDS consequences are appended later from hapFlush.
                 if (vrec.vcsqs.items.len > 1) {
                     std.mem.sort(Vcsq, vrec.vcsqs.items, {}, vcsqCmpLessThan);
                 }
