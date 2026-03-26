@@ -12,6 +12,7 @@ const ArrayList = std.ArrayList;
 const types = @import("types.zig");
 const gff_types = @import("../gff/types.zig");
 const translate = @import("translate.zig");
+const splice_mod = @import("splice.zig");
 
 const CsqType = types.CsqType;
 const HapNode = types.HapNode;
@@ -556,7 +557,6 @@ pub fn hapInit(
 
     // ── Step 1: splice analysis ────────────────────────────────────
 
-    const splice_mod = @import("splice.zig");
     var splice = splice_mod.Splice.init(allocator, tr);
     defer splice.deinit();
 
@@ -597,18 +597,17 @@ pub fn hapInit(
     // Verify start codon is actually M before checking for start_lost
     if (splice.flags.check_start) {
         if (tscript_aux.ref_seq) |ref_seq| {
-            const translate_mod = @import("translate.zig");
             if (tr.strand == .forward) {
                 const off = n_ref_pad + cds.beg -| tr.beg;
                 if (off + 3 <= ref_seq.len) {
-                    const stop_ch = translate_mod.dna2stop(translate_mod.findGeneticCode(0) orelse unreachable, ref_seq[off..][0..3]);
+                    const stop_ch = translate.dna2stop(translate.findGeneticCode(0) orelse unreachable, ref_seq[off..][0..3]);
                     if (stop_ch == null or stop_ch.? != 'M')
                         splice.flags.check_start = false;
                 }
             } else if (tr.strand == .reverse) {
                 const off = n_ref_pad + cds.beg -| tr.beg + cds.len -| 3;
                 if (off + 3 <= ref_seq.len) {
-                    const stop_ch = translate_mod.cdna2stop(translate_mod.findGeneticCode(0) orelse unreachable, ref_seq[off..][0..3]);
+                    const stop_ch = translate.cdna2stop(translate.findGeneticCode(0) orelse unreachable, ref_seq[off..][0..3]);
                     if (stop_ch == null or stop_ch.? != 'M')
                         splice.flags.check_start = false;
                 }
@@ -751,44 +750,432 @@ pub fn hapInit(
 /// Finalize all haplotypes for a transcript by performing a DFS traversal
 /// of the haplotype tree.
 ///
+/// Ported from the C `hap_finalize()` function (csq.c lines 2374-2551).
+///
 /// For each leaf node reached during traversal:
 ///   1. The spliced alt sequence is reconstructed from the stack
-///   2. It is broken into independent parts by codon boundaries
-///   3. Each part is translated (both ref and alt)
-///   4. hapAddCsq determines the consequence
-///
-/// This is a skeleton. The full implementation requires:
-///   - Building the spliced reference (tscript_splice_ref)
-///   - The explicit DFS stack traversal matching the C code's break-by-codon logic
-///   - Calling cdsTranslate for each independent part
-///   - Calling hapAddCsq and pushing consequences to the output buffer
-///
-/// TODO:
-///   - Implement tscript_splice_ref (build padded spliced reference)
-///   - Implement the full DFS with codon-boundary partitioning
-///   - Forward strand: walk stack indices 1..istack, group by codon boundaries
-///   - Reverse strand: walk stack indices istack..1, group by codon boundaries
-///   - For each group: translate alt and ref, call hapAddCsq
+///   2. It is broken into independent parts by codon boundaries:
+///      - Forward strand: left-to-right, break when dlen%3==0 AND
+///        consecutive variants are in different codons
+///      - Reverse strand: right-to-left with the same logic
+///   3. Each part is translated (both ref and alt) via cdsTranslate
+///   4. hapAddCsq determines the consequence type
 pub fn hapFinalize(ctx: *HapContext) !void {
-    _ = ctx;
-    // TODO: Full DFS implementation
-    //
-    // Pseudocode from the C version:
-    //
-    //   1. Ensure sref is built (tscript_splice_ref)
-    //   2. Push root onto stack at index 0
-    //   3. While stack is not empty:
-    //      a. Advance to next unvisited child
-    //      b. If no more children, pop (istack--)
-    //      c. Otherwise push child, append its seq to sseq
-    //      d. If child is a leaf (nend > 0):
-    //         - For forward strand: walk i=1..istack, group variants by codon boundary
-    //         - For reverse strand: walk i=istack..1, group variants by codon boundary
-    //         - For each group:
-    //           * Extract alt sequence from sseq
-    //           * Extract ref sequence from sref
-    //           * Call cdsTranslate for both
-    //           * Call hapAddCsq
+    const tr_opaque = ctx.tr orelse return;
+    // The GFF transcript is stored as an opaque pointer in HapContext.
+    // We need the Tscript (aux data) which holds the ref/sref and root.
+    // By convention, the transcript's .aux field points to the Tscript.
+    const tr_ptr: *const gff_types.Transcript = @ptrCast(@alignCast(tr_opaque));
+    const tscript_aux: *types.Tscript = @ptrCast(@alignCast(tr_ptr.aux orelse return));
+    const allocator = ctx.allocator;
+
+    // Build spliced reference if not done yet
+    if (tscript_aux.sref == null)
+        try tscriptSpliceRef(tscript_aux, tr_ptr);
+
+    const sref = tscript_aux.sref orelse return;
+    const sref_len: usize = @intCast(tscript_aux.nsref);
+
+    // Initialize traversal stack with root
+    ctx.stack.clearRetainingCapacity();
+    try ctx.stack.append(allocator, .{
+        .node = tscript_aux.root,
+        .ichild = -1,
+        .slen = 0,
+        .dlen = 0,
+    });
+
+    ctx.sseq.clearRetainingCapacity();
+
+    var istack: usize = 0;
+
+    while (true) {
+        if (istack >= ctx.stack.items.len) break;
+
+        const node = ctx.stack.items[istack].node orelse break;
+
+        // Find next non-null child
+        var found_child = false;
+        {
+            var ichild = ctx.stack.items[istack].ichild + 1;
+            while (ichild < @as(i32, @intCast(node.children.items.len))) : (ichild += 1) {
+                ctx.stack.items[istack].ichild = ichild;
+                found_child = true;
+                break;
+            }
+            if (!found_child)
+                ctx.stack.items[istack].ichild = @intCast(node.children.items.len);
+        }
+
+        if (!found_child) {
+            if (istack == 0) break;
+            istack -= 1;
+            continue;
+        }
+
+        const child_idx: usize = @intCast(ctx.stack.items[istack].ichild);
+        const child_node = node.children.items[child_idx];
+
+        istack += 1;
+
+        // Ensure stack capacity
+        while (ctx.stack.items.len <= istack)
+            try ctx.stack.append(allocator, .{});
+
+        const parent_slen = ctx.stack.items[istack - 1].slen;
+        const parent_dlen = ctx.stack.items[istack - 1].dlen;
+
+        ctx.stack.items[istack] = .{
+            .node = child_node,
+            .ichild = -1,
+            .slen = 0, // will be set below
+            .dlen = parent_dlen + child_node.dlen,
+        };
+
+        // Build spliced sequence up to this point
+        ctx.sseq.shrinkRetainingCapacity(parent_slen);
+        if (child_node.payload == .cds) {
+            if (child_node.payload.cds.seq) |seq|
+                try ctx.sseq.appendSlice(allocator, seq);
+        }
+        ctx.stack.items[istack].slen = ctx.sseq.items.len;
+
+        if (child_node.nend == 0) continue; // not a leaf
+
+        // ── Leaf node: break into independent parts and translate ────
+
+        const total_dlen = ctx.stack.items[istack].dlen;
+        const sref_coding_len: i64 = @as(i64, @intCast(sref_len)) - 2 * @as(i64, n_ref_pad);
+        const seq_m: usize = @intCast(@max(0, sref_coding_len + total_dlen));
+        ctx.upstream_stop = false;
+
+        // Set sbeg from the first real node (index 1)
+        if (istack >= 1 and ctx.stack.items.len > 1) {
+            if (ctx.stack.items[1].node) |n1|
+                ctx.sbeg = n1.sbeg;
+        }
+
+        std.debug.assert(child_node.payload != .sss);
+        const stack = ctx.stack.items;
+
+        if (tr_ptr.strand == .forward) {
+            var i: usize = 0;
+            var ibeg_s: i64 = -1;
+            var dlen_acc: i32 = 0;
+            var indel_flag = false;
+
+            while (true) {
+                i += 1;
+                if (i > istack) break;
+
+                std.debug.assert(stack[i].node.?.payload != .sss);
+
+                dlen_acc += stack[i].node.?.dlen;
+                if (stack[i].node.?.dlen != 0) indel_flag = true;
+
+                // Decide whether to flush this portion
+                if (i < istack) {
+                    if (@rem(dlen_acc, 3) != 0) {
+                        if (ibeg_s == -1) ibeg_s = @intCast(i);
+                        continue;
+                    }
+                    // Same codon check (forward strand)
+                    var icur = ctx.sbeg + (stack[i].slen -| rlenPlusDlen(stack[i].node.?));
+                    const inext = ctx.sbeg + (stack[i + 1].slen -| rlenPlusDlen(stack[i + 1].node.?));
+                    if (stack[i].node.?.dlen > 0)
+                        icur += @as(usize, @intCast(stack[i].node.?.dlen))
+                    else if (stack[i].node.?.dlen < 0)
+                        icur += 1;
+                    if (icur / 3 == inext / 3) {
+                        if (ibeg_s == -1) ibeg_s = @intCast(i);
+                        continue;
+                    }
+                }
+                if (ibeg_s < 0) ibeg_s = @intCast(i);
+
+                const ibeg_u: usize = @intCast(ibeg_s);
+                const ioff = stack[ibeg_u].slen -| rlenPlusDlen(stack[ibeg_u].node.?);
+                const icur_pos: u32 = @intCast(ctx.sbeg + ioff);
+                const rbeg_val = stack[ibeg_u].node.?.sbeg;
+                const rend_val = stack[i].node.?.sbeg + @as(u32, @intCast(@max(@as(i32, 0), stack[i].node.?.rlen)));
+                const fill: i32 = @rem(dlen_acc, 3);
+
+                // Translate alt
+                if (ctx.sseq.items.len > 0) {
+                    const alt_end = stack[i].slen;
+                    const alt_seq = if (alt_end > ioff) ctx.sseq.items[ioff..alt_end] else &[_]u8{};
+                    try cdsTranslate(allocator, sref, sref_len, alt_seq, seq_m, icur_pos, rbeg_val, rend_val, .forward, &ctx.tseq, &ctx.tseq_stop, fill, ctx.gencode);
+                } else {
+                    try cdsTranslate(allocator, sref, sref_len, &[_]u8{}, seq_m, icur_pos, rbeg_val, rend_val, .forward, &ctx.tseq, &ctx.tseq_stop, 0, ctx.gencode);
+                }
+
+                // Translate ref
+                {
+                    const ref_start = n_ref_pad + rbeg_val;
+                    const ref_len = rend_val - rbeg_val;
+                    const ref_slice = if (ref_start + ref_len <= sref.len) sref[ref_start .. ref_start + ref_len] else &[_]u8{};
+                    try cdsTranslate(allocator, sref, sref_len, ref_slice, sref_len - 2 * n_ref_pad, rbeg_val, rbeg_val, rend_val, .forward, &ctx.tref, &ctx.tref_stop, fill, ctx.gencode);
+                }
+
+                // Determine consequence
+                const csq_result = hapAddCsq(
+                    ctx.tref.items,
+                    ctx.tref_stop.items,
+                    ctx.tseq.items,
+                    ctx.tseq_stop.items,
+                    dlen_acc,
+                    indel_flag,
+                    accumulateCompound(stack, ibeg_u, i),
+                    stack[ibeg_u].node.?.payload == .sss,
+                    ibeg_u != i,
+                    ctx.upstream_stop,
+                );
+                ctx.upstream_stop = csq_result.upstream_stop;
+
+                // Record consequence on the leaf node
+                var csq_entry: types.Csq = .{
+                    .pos = stack[if (tr_ptr.strand == .forward) ibeg_u else i].node.?.rbeg,
+                    .type_info = .{
+                        .csq_type = csq_result.csq_type,
+                        .trid = tr_ptr.id,
+                        .vcf_ial = @intCast(child_node.vcf_ial),
+                        .gene = if (tr_ptr.gene) |g| blk: {
+                            break :blk if (g.name) |n| std.mem.span(n) else null;
+                        } else null,
+                        .strand = tr_ptr.strand == .forward,
+                        .biotype = @intFromEnum(tr_ptr.biotype),
+                    },
+                };
+                // Build variant string in vstr
+                try buildVstr(allocator, &csq_entry.type_info.vstr, stack, ibeg_u, i, ctx, sref_len, seq_m, tr_ptr);
+                try child_node.csq_list.append(allocator, csq_entry);
+
+                ibeg_s = -1;
+                dlen_acc = 0;
+                indel_flag = false;
+            }
+        } else if (tr_ptr.strand == .reverse) {
+            var i: usize = istack + 1;
+            var ibeg_s: i64 = -1;
+            var dlen_acc: i32 = 0;
+            var indel_flag = false;
+
+            while (i > 1) {
+                i -= 1;
+
+                std.debug.assert(stack[i].node.?.payload != .sss);
+
+                dlen_acc += stack[i].node.?.dlen;
+                if (stack[i].node.?.dlen != 0) indel_flag = true;
+
+                if (i > 1) {
+                    if (@rem(dlen_acc, 3) != 0) {
+                        if (ibeg_s == -1) ibeg_s = @intCast(i);
+                        continue;
+                    }
+                    // Same codon check (reverse strand)
+                    var icur_rev: i64 = @as(i64, @intCast(seq_m)) - 1 - @as(i64, @intCast(ctx.sbeg + (stack[i].slen -| rlenPlusDlen(stack[i].node.?))));
+                    var inext_rev: i64 = @as(i64, @intCast(seq_m)) - 1 - @as(i64, @intCast(ctx.sbeg + (stack[i - 1].slen -| rlenPlusDlen(stack[i - 1].node.?))));
+                    if (stack[i].node.?.dlen > 0) icur_rev += stack[i].node.?.dlen - 1 else if (stack[i].node.?.dlen < 0) icur_rev -= stack[i].node.?.dlen;
+                    if (stack[i - 1].node.?.dlen > 0) inext_rev -= stack[i - 1].node.?.dlen;
+                    if (icur_rev >= 0 and inext_rev >= 0) {
+                        if (@as(u64, @intCast(icur_rev)) / 3 == @as(u64, @intCast(inext_rev)) / 3) {
+                            if (ibeg_s == -1) ibeg_s = @intCast(i);
+                            continue;
+                        }
+                    }
+                }
+                if (ibeg_s < 0) ibeg_s = @intCast(i);
+
+                const ibeg_u: usize = @intCast(ibeg_s);
+                const ioff = stack[i].slen -| rlenPlusDlen(stack[i].node.?);
+                const icur_pos: u32 = @intCast(ctx.sbeg + ioff);
+                const rbeg_val = stack[i].node.?.sbeg;
+                const rend_val = stack[ibeg_u].node.?.sbeg + @as(u32, @intCast(@max(@as(i32, 0), stack[ibeg_u].node.?.rlen)));
+                const fill: i32 = @rem(dlen_acc, 3);
+
+                // Translate alt
+                if (ctx.sseq.items.len > 0) {
+                    const alt_end = stack[ibeg_u].slen;
+                    const alt_seq = if (alt_end > ioff) ctx.sseq.items[ioff..alt_end] else &[_]u8{};
+                    try cdsTranslate(allocator, sref, sref_len, alt_seq, seq_m, icur_pos, rbeg_val, rend_val, .reverse, &ctx.tseq, &ctx.tseq_stop, fill, ctx.gencode);
+                } else {
+                    try cdsTranslate(allocator, sref, sref_len, &[_]u8{}, seq_m, icur_pos, rbeg_val, rend_val, .reverse, &ctx.tseq, &ctx.tseq_stop, 0, ctx.gencode);
+                }
+
+                // Translate ref
+                {
+                    const ref_start = n_ref_pad + rbeg_val;
+                    const ref_len = rend_val - rbeg_val;
+                    const ref_slice = if (ref_start + ref_len <= sref.len) sref[ref_start .. ref_start + ref_len] else &[_]u8{};
+                    try cdsTranslate(allocator, sref, sref_len, ref_slice, sref_len - 2 * n_ref_pad, rbeg_val, rbeg_val, rend_val, .reverse, &ctx.tref, &ctx.tref_stop, fill, ctx.gencode);
+                }
+
+                // Determine consequence
+                const csq_result = hapAddCsq(
+                    ctx.tref.items,
+                    ctx.tref_stop.items,
+                    ctx.tseq.items,
+                    ctx.tseq_stop.items,
+                    dlen_acc,
+                    indel_flag,
+                    accumulateCompound(stack, i, ibeg_u),
+                    stack[i].node.?.payload == .sss,
+                    i != ibeg_u,
+                    ctx.upstream_stop,
+                );
+                ctx.upstream_stop = csq_result.upstream_stop;
+
+                // Record consequence on the leaf node
+                var csq_entry: types.Csq = .{
+                    .pos = stack[ibeg_u].node.?.rbeg,
+                    .type_info = .{
+                        .csq_type = csq_result.csq_type,
+                        .trid = tr_ptr.id,
+                        .vcf_ial = @intCast(child_node.vcf_ial),
+                        .gene = if (tr_ptr.gene) |g| blk: {
+                            break :blk if (g.name) |n| std.mem.span(n) else null;
+                        } else null,
+                        .strand = tr_ptr.strand == .forward,
+                        .biotype = @intFromEnum(tr_ptr.biotype),
+                    },
+                };
+                try buildVstr(allocator, &csq_entry.type_info.vstr, stack, i, ibeg_u, ctx, sref_len, seq_m, tr_ptr);
+                try child_node.csq_list.append(allocator, csq_entry);
+
+                ibeg_s = -1;
+                dlen_acc = 0;
+                indel_flag = false;
+            }
+        }
+    }
+}
+
+/// Build the spliced reference for a transcript by concatenating CDS exons.
+/// Corresponds to C function tscript_splice_ref().
+fn tscriptSpliceRef(tscript_aux: *types.Tscript, tr: *const gff_types.Transcript) !void {
+    const ref_seq = tscript_aux.ref_seq orelse return error.InvalidStrand;
+    const allocator = std.heap.page_allocator; // TODO: pass allocator properly
+
+    var total_len: usize = 0;
+    for (tr.cds.items) |cds| total_len += cds.len;
+
+    const sref_len = total_len + 2 * n_ref_pad;
+    const sref_buf = try allocator.alloc(u8, sref_len);
+    var pos: usize = 0;
+
+    // Left padding
+    const first_cds = tr.cds.items[0];
+    const pad_start = first_cds.beg -| tr.beg;
+    if (pad_start + n_ref_pad <= ref_seq.len)
+        @memcpy(sref_buf[0..n_ref_pad], ref_seq[pad_start .. pad_start + n_ref_pad]);
+    pos += n_ref_pad;
+
+    // Copy each exon
+    for (tr.cds.items) |cds| {
+        const src_off = n_ref_pad + cds.beg -| tr.beg;
+        if (src_off + cds.len <= ref_seq.len)
+            @memcpy(sref_buf[pos .. pos + cds.len], ref_seq[src_off .. src_off + cds.len]);
+        pos += cds.len;
+    }
+
+    // Right padding
+    const last_cds = tr.cds.items[tr.cds.items.len - 1];
+    const right_start = n_ref_pad + last_cds.beg -| tr.beg + last_cds.len;
+    if (right_start + n_ref_pad <= ref_seq.len)
+        @memcpy(sref_buf[pos .. pos + n_ref_pad], ref_seq[right_start .. right_start + n_ref_pad]);
+    pos += n_ref_pad;
+
+    tscript_aux.sref = sref_buf[0..pos];
+    tscript_aux.nsref = @intCast(pos);
+}
+
+/// Helper: compute rlen + dlen for a node (used in soff calculation).
+fn rlenPlusDlen(node: *const HapNode) usize {
+    const rlen_u: usize = if (node.rlen >= 0) @intCast(node.rlen) else 0;
+    const dlen_u: usize = if (node.dlen >= 0) @intCast(node.dlen) else 0;
+    return rlen_u + dlen_u;
+}
+
+/// The compound-consequence bitmask, matching the C CSQ_COMPOUND definition.
+/// Duplicated here because CsqType.compound_mask is private to types.zig.
+const compound_mask: u32 = (1 << 1) | // synonymous_variant
+    (1 << 2) | // missense_variant
+    (1 << 3) | // stop_lost
+    (1 << 4) | // stop_gained
+    (1 << 5) | // inframe_deletion
+    (1 << 6) | // inframe_insertion
+    (1 << 7) | // frameshift_variant
+    (1 << 10) | // start_lost
+    (1 << 12) | // stop_retained
+    (1 << 18) | // inframe_altering
+    (1 << 19) | // upstream_stop
+    (1 << 20) | // incomplete_cds
+    (1 << 22) | // elongation
+    (1 << 23) | // truncation
+    (1 << 24); // start_retained
+
+/// Accumulate compound consequence flags from stack entries [ibeg..iend].
+fn accumulateCompound(stack: []const Hstack, ibeg: usize, iend: usize) CsqType {
+    var raw: u32 = 0;
+    var i = ibeg;
+    while (i <= iend) : (i += 1) {
+        raw |= stack[i].node.?.csq.toInt() & compound_mask;
+    }
+    return CsqType.fromInt(raw);
+}
+
+/// Build the variant string (vstr) for a consequence: |aa_pos ref_aa>alt_aa|dna_variants
+fn buildVstr(
+    allocator: Allocator,
+    vstr: *ArrayList(u8),
+    stack: []const Hstack,
+    ibeg: usize,
+    iend: usize,
+    ctx: *const HapContext,
+    sref_len: usize,
+    seq_m: usize,
+    tr: *const gff_types.Transcript,
+) !void {
+    _ = seq_m;
+
+    const rbeg_val = stack[ibeg].node.?.sbeg;
+    const rend_val = stack[iend].node.?.sbeg + @as(u32, @intCast(@max(@as(i32, 0), stack[iend].node.?.rlen)));
+    _ = rend_val;
+
+    const aa_rbeg: usize = if (tr.strand == .forward)
+        rbeg_val / 3 + 1
+    else
+        (sref_len -| 2 * n_ref_pad -| (stack[iend].node.?.sbeg + @as(u32, @intCast(@max(@as(i32, 0), stack[iend].node.?.rlen))))) / 3 + 1;
+
+    try vstr.append(allocator, '|');
+    {
+        var buf: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{d}", .{aa_rbeg}) catch return;
+        try vstr.appendSlice(allocator, s);
+    }
+    try vstr.appendSlice(allocator, ctx.tref.items);
+    try vstr.append(allocator, '>');
+    {
+        var buf: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{d}", .{aa_rbeg}) catch return;
+        try vstr.appendSlice(allocator, s);
+    }
+    try vstr.appendSlice(allocator, ctx.tseq.items);
+    try vstr.append(allocator, '|');
+
+    // DNA variant string: position + var for each node
+    var first = true;
+    var i = ibeg;
+    while (i <= iend) : (i += 1) {
+        if (!first) try vstr.append(allocator, '+');
+        first = false;
+        const n = stack[i].node.?;
+        var buf: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{d}", .{n.rbeg + 1}) catch return;
+        try vstr.appendSlice(allocator, s);
+        if (n.var_str) |vs| try vstr.appendSlice(allocator, vs);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1182,4 +1569,267 @@ test "HapContext init and deinit" {
     try std.testing.expect(ctx.tr == null);
     try std.testing.expect(!ctx.upstream_stop);
     try std.testing.expectEqual(@as(usize, 0), ctx.sseq.items.len);
+}
+
+test "hapInit returns discarded for ref==alt" {
+    const allocator = std.testing.allocator;
+
+    // Set up a minimal transcript with one CDS exon
+    var tr = gff_types.Transcript.init(allocator);
+    defer tr.deinit();
+    tr.id = 1;
+    tr.beg = 100;
+    tr.end = 108;
+    tr.strand = .forward;
+
+    // Build a reference: pad + ATGAAATTT (MKF) + pad
+    const ref_str = "NNNNNNNNNN" ++ "ATGAAATTT" ++ "NNNNNNNNNN";
+    var ref_buf: [ref_str.len]u8 = ref_str.*;
+
+    var tscript_data: types.Tscript = .{
+        .ref_seq = &ref_buf,
+    };
+
+    var cds_entry = gff_types.CdsEntry{
+        .tr = &tr,
+        .beg = 100,
+        .pos = 0,
+        .len = 9,
+        .icds = 0,
+        .phase = .phase0,
+    };
+    try tr.cds.append(allocator, &cds_entry);
+
+    var root = HapNode.init(.root);
+    var child = HapNode.init(.cds);
+
+    // ref == alt: should be discarded
+    const result = try hapInit(
+        allocator,
+        &root,
+        &child,
+        &cds_entry,
+        103,
+        "A",
+        "A",
+        1,
+        &tscript_data,
+    );
+
+    try std.testing.expectEqual(HapInitResult.discarded, result);
+}
+
+test "hapInit creates CDS node for coding SNP" {
+    const allocator = std.testing.allocator;
+
+    var tr = gff_types.Transcript.init(allocator);
+    defer tr.deinit();
+    tr.id = 1;
+    tr.beg = 100;
+    tr.end = 108;
+    tr.strand = .forward;
+
+    const ref_str = "NNNNNNNNNN" ++ "ATGAAATTT" ++ "NNNNNNNNNN";
+    var ref_buf: [ref_str.len]u8 = ref_str.*;
+
+    var tscript_data: types.Tscript = .{
+        .ref_seq = &ref_buf,
+    };
+
+    var cds_entry = gff_types.CdsEntry{
+        .tr = &tr,
+        .beg = 100,
+        .pos = 0,
+        .len = 9,
+        .icds = 0,
+        .phase = .phase0,
+    };
+    try tr.cds.append(allocator, &cds_entry);
+
+    var root = HapNode.init(.root);
+    var child = HapNode.init(.cds);
+    defer {
+        // Free allocations made by hapInit
+        if (child.var_str) |vs| allocator.free(vs);
+        if (child.payload == .cds) {
+            if (child.payload.cds.seq) |seq| allocator.free(seq);
+        }
+    }
+
+    // SNP inside the exon at position 103: A>T
+    const result = try hapInit(
+        allocator,
+        &root,
+        &child,
+        &cds_entry,
+        103,
+        "A",
+        "T",
+        1,
+        &tscript_data,
+    );
+
+    try std.testing.expectEqual(HapInitResult.added, result);
+    try std.testing.expect(child.payload == .cds);
+    try std.testing.expectEqual(@as(i32, 0), child.dlen); // SNP: no length change
+    try std.testing.expect(child.var_str != null);
+    try std.testing.expectEqualStrings("A>T", child.var_str.?);
+}
+
+test "hapFinalize produces consequence for simple 2-node tree" {
+    const allocator = std.testing.allocator;
+    const gencode = translate.findGeneticCode(0) orelse unreachable;
+
+    // Build a minimal transcript: one exon, ATGAAATTT (M K F)
+    var tr = gff_types.Transcript.init(allocator);
+    defer tr.deinit();
+    tr.id = 1;
+    tr.beg = 100;
+    tr.end = 108;
+    tr.strand = .forward;
+    tr.biotype = .protein_coding;
+
+    const ref_str = "NNNNNNNNNN" ++ "ATGAAATTT" ++ "NNNNNNNNNN";
+    var ref_buf: [ref_str.len]u8 = ref_str.*;
+
+    // Create root node
+    var root = HapNode.init(.root);
+    defer root.deinit(allocator);
+
+    var tscript_data: types.Tscript = .{
+        .ref_seq = &ref_buf,
+        .root = &root,
+    };
+    tr.aux = @ptrCast(&tscript_data);
+
+    var cds_entry = gff_types.CdsEntry{
+        .tr = &tr,
+        .beg = 100,
+        .pos = 0,
+        .len = 9,
+        .icds = 0,
+        .phase = .phase0,
+    };
+    try tr.cds.append(allocator, &cds_entry);
+
+    // CDS child: SNP at spliced pos 3, changing codon AAA -> TAA (K -> stop)
+    var child_node = HapNode.init(.cds);
+    child_node.payload = .{ .cds = .{ .seq = @constCast("T") } };
+    child_node.var_str = "A>T";
+    child_node.dlen = 0;
+    child_node.rbeg = 3;
+    child_node.rlen = 1;
+    child_node.sbeg = 3;
+    child_node.icds = 0;
+    child_node.vcf_ial = 1;
+    child_node.nend = 1; // leaf
+    child_node.prev = &root;
+
+    try root.children.append(allocator, &child_node);
+
+    // Create HapContext and run finalize
+    var ctx = HapContext.init(allocator, gencode);
+    defer ctx.deinit();
+    ctx.tr = @ptrCast(&tr);
+
+    try hapFinalize(&ctx);
+
+    // The child node should have at least one consequence
+    try std.testing.expect(child_node.csq_list.items.len > 0);
+
+    // Clean up csq_list
+    for (child_node.csq_list.items) |*c| c.deinit(allocator);
+    child_node.csq_list.deinit(allocator);
+}
+
+test "hapFinalize merges compound variants in same codon" {
+    const allocator = std.testing.allocator;
+    const gencode = translate.findGeneticCode(0) orelse unreachable;
+
+    // Transcript with one exon: ATGAAATTTCCC (M K F P)
+    var tr = gff_types.Transcript.init(allocator);
+    defer tr.deinit();
+    tr.id = 1;
+    tr.beg = 100;
+    tr.end = 111;
+    tr.strand = .forward;
+    tr.biotype = .protein_coding;
+
+    const ref_str = "NNNNNNNNNN" ++ "ATGAAATTTCCC" ++ "NNNNNNNNNN";
+    var ref_buf: [ref_str.len]u8 = ref_str.*;
+
+    var root = HapNode.init(.root);
+    defer root.deinit(allocator);
+
+    var tscript_data: types.Tscript = .{
+        .ref_seq = &ref_buf,
+        .root = &root,
+    };
+    tr.aux = @ptrCast(&tscript_data);
+
+    var cds_entry = gff_types.CdsEntry{
+        .tr = &tr,
+        .beg = 100,
+        .pos = 0,
+        .len = 12,
+        .icds = 0,
+        .phase = .phase0,
+    };
+    try tr.cds.append(allocator, &cds_entry);
+
+    // Two SNPs in same codon (AAA at positions 3,4): pos 3 A>T, pos 4 A>T
+    var child1 = HapNode.init(.cds);
+    child1.payload = .{ .cds = .{ .seq = @constCast("T") } };
+    child1.var_str = "A>T";
+    child1.dlen = 0;
+    child1.rbeg = 3;
+    child1.rlen = 1;
+    child1.sbeg = 3;
+    child1.icds = 0;
+    child1.vcf_ial = 1;
+    child1.nend = 0; // not a leaf
+    child1.prev = &root;
+    try root.children.append(allocator, &child1);
+
+    var child2 = HapNode.init(.cds);
+    child2.payload = .{ .cds = .{ .seq = @constCast("T") } };
+    child2.var_str = "A>T";
+    child2.dlen = 0;
+    child2.rbeg = 4;
+    child2.rlen = 1;
+    child2.sbeg = 4;
+    child2.icds = 0;
+    child2.vcf_ial = 1;
+    child2.nend = 1; // leaf
+    child2.prev = &child1;
+    try child1.children.append(allocator, &child2);
+
+    var ctx = HapContext.init(allocator, gencode);
+    defer ctx.deinit();
+    ctx.tr = @ptrCast(&tr);
+
+    try hapFinalize(&ctx);
+
+    // child2 (the leaf) should have consequence(s) that merge both variants
+    try std.testing.expect(child2.csq_list.items.len > 0);
+
+    // The consequence vstr should contain '+' indicating merged DNA variant entries
+    var found_compound = false;
+    for (child2.csq_list.items) |c| {
+        for (c.type_info.vstr.items) |ch| {
+            if (ch == '+') {
+                found_compound = true;
+                break;
+            }
+        }
+        if (found_compound) break;
+    }
+    try std.testing.expect(found_compound);
+
+    // Clean up: HapNode.deinit only frees its own arrays, not children's
+    for (child2.csq_list.items) |*c| c.deinit(allocator);
+    child2.csq_list.deinit(allocator);
+    child1.children.deinit(allocator);
+    child1.csq_list.deinit(allocator);
+    child1.cur_child.deinit(allocator);
 }
