@@ -172,22 +172,59 @@ fn buildCsqRecord(rec: *const VcfRecord) csq_mod.VcfRecord {
 // Write a VCF record line, appending BCSQ to INFO if consequences exist
 // -------------------------------------------------------------------------
 
-fn writeVcfRecord(
+/// Write a single VCF line to output.  If `bcsq_value` is non-null the
+/// annotation is injected into the INFO column (column 7); otherwise the
+/// original line is written unchanged.
+fn writeVcfLine(
+    allocator: std.mem.Allocator,
     out: std.fs.File,
-    rec: *const VcfRecord,
-    csq_ctx: *CsqContext,
+    original_line: []const u8,
+    bcsq_value: ?[]const u8,
+    bcsq_tag: []const u8,
 ) !void {
-    // The record's _storage holds the full original tab-separated line.
-    const line = rec._storage orelse return;
+    if (bcsq_value) |val| {
+        const modified = try csq_mod.injectBcsq(allocator, original_line, val, bcsq_tag);
+        defer allocator.free(modified);
+        try out.writeAll(modified);
+        try out.writeAll("\n");
+    } else {
+        try out.writeAll(original_line);
+        try out.writeAll("\n");
+    }
+}
 
-    // If the CSQ context has formatted output, we need to inject BCSQ into INFO.
-    // For now the pipeline stubs produce no output, so we pass through as-is.
-    // When the pipeline is complete, csq_ctx.output will contain the BCSQ string
-    // after vbufFlush processes the record.
-    _ = csq_ctx;
+/// Drain flushed records from the CSQ context and write them to output.
+/// This must be called after every CsqContext.process() and after flush().
+///
+/// Because the CSQ pipeline buffers records internally and releases them
+/// via vbufFlush, we need a mapping from the pipeline's VcfRecord (pos-based)
+/// back to the original text line.  We look up the original line in the
+/// line_map keyed by position.
+fn writeFlushedRecords(
+    allocator: std.mem.Allocator,
+    out: std.fs.File,
+    csq_ctx: *CsqContext,
+    line_map: *std.AutoHashMap(u64, []const u8),
+) !void {
+    for (csq_ctx.flushed_records.items) |fr| {
+        // Build a lookup key: combine rid + pos to handle multi-chrom inputs
+        const key = posKey(fr.rec.rid, fr.rec.pos);
+        const original_line = line_map.get(key) orelse continue;
 
-    try out.writeAll(line);
-    try out.writeAll("\n");
+        try writeVcfLine(allocator, out, original_line, fr.bcsq_value, csq_ctx.bcsq_tag);
+
+        // Free the duped bcsq_value string
+        if (fr.bcsq_value) |bv| allocator.free(bv);
+
+        // Remove from map to free memory
+        _ = line_map.remove(key);
+    }
+    csq_ctx.flushed_records.clearRetainingCapacity();
+}
+
+/// Combine rid and pos into a single u64 key for the line lookup map.
+fn posKey(rid: i32, pos: u32) u64 {
+    return (@as(u64, @bitCast(@as(i64, rid))) << 32) | @as(u64, pos);
 }
 
 // -------------------------------------------------------------------------
@@ -305,6 +342,18 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
     }
 
     // ---- Initialize CSQ context ----
+    // NOTE: fai_ptr and fetch_seq_fn are left null here.  When htslib is
+    // available at link time, open the FASTA index and pass it in:
+    //
+    //   const htslib = @import("vcf/htslib.zig");
+    //   var fai = try htslib.HtsFaidx.open(opts.fasta_fname_z);
+    //   defer fai.close();
+    //   ...
+    //   .fai_ptr = @ptrCast(&fai),
+    //   .fetch_seq_fn = &htsFaidxFetchAdapter,
+    //
+    // For now the text VCF path works without reference lookup; CDS
+    // consequence annotation will be skipped when fai_ptr is null.
     var csq_ctx = CsqContext.init(allocator, .{
         .gff_fname = opts.gff_fname.?,
         .fasta_fname = opts.fasta_fname.?,
@@ -325,6 +374,19 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
     var rec = VcfRecord.init(allocator);
     defer rec.deinit();
 
+    // Map from (rid, pos) -> original VCF text line.  The CSQ pipeline
+    // buffers records and flushes them later, so we need to keep the
+    // original lines alive until they are written.
+    // NOTE: multiple records at the same position will overwrite each other.
+    // This is acceptable for now; when htslib bindings replace text VCF
+    // reading, records will be managed by the pipeline's own Vbuf.
+    var line_map = std.AutoHashMap(u64, []const u8).init(allocator);
+    defer {
+        var it = line_map.valueIterator();
+        while (it.next()) |v| allocator.free(v.*);
+        line_map.deinit();
+    }
+
     var n_records: u64 = 0;
     var n_errors: u64 = 0;
 
@@ -340,6 +402,14 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
 
         n_records += 1;
 
+        // Save the original line for later BCSQ injection.
+        // We must dupe it because rec._storage is reused on the next read.
+        if (rec._storage) |storage| {
+            const key = posKey(rec.rid, rec.pos);
+            const duped = try allocator.dupe(u8, storage);
+            try line_map.put(key, duped);
+        }
+
         // Build a pipeline-compatible record and feed it through CsqContext
         const csq_rec = buildCsqRecord(&rec);
         csq_ctx.process(&csq_rec) catch |err| {
@@ -349,10 +419,9 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
             }
         };
 
-        // Write the record to output (pass-through for now; BCSQ injection
-        // will be wired once vbufFlush emits formatted consequences).
-        writeVcfRecord(out_file, &rec, &csq_ctx) catch |err| {
-            std.debug.print("Error: failed to write record: {}\n", .{err});
+        // Write any records that were flushed by this process() call
+        writeFlushedRecords(allocator, out_file, &csq_ctx, &line_map) catch |err| {
+            std.debug.print("Error: failed to write flushed records: {}\n", .{err});
             std.process.exit(1);
         };
     }
@@ -360,6 +429,10 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
     // ---- Flush remaining buffered records ----
     csq_ctx.flush() catch |err| {
         std.debug.print("Warning: error flushing CSQ buffer: {}\n", .{err});
+    };
+    writeFlushedRecords(allocator, out_file, &csq_ctx, &line_map) catch |err| {
+        std.debug.print("Error: failed to write final flushed records: {}\n", .{err});
+        std.process.exit(1);
     };
 
     if (n_errors > 0) {

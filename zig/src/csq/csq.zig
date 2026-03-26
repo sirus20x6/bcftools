@@ -13,6 +13,10 @@ const splice_mod = @import("splice.zig");
 const gff_mod = @import("../gff/gff.zig");
 const gff_types = @import("../gff/types.zig");
 const region = @import("../core/region.zig");
+const types = @import("types.zig");
+
+const haplotype_mod = @import("haplotype.zig");
+const translate = @import("translate.zig");
 
 const Splice = splice_mod.Splice;
 const SpliceResult = splice_mod.SpliceResult;
@@ -21,6 +25,10 @@ const Transcript = gff_types.Transcript;
 const CdsEntry = gff_types.CdsEntry;
 const Utr = gff_types.Utr;
 const Exon = gff_types.Exon;
+const Tscript = types.Tscript;
+const HapNode = types.HapNode;
+const HapNodeType = types.HapNodeType;
+const HapInitResult = haplotype_mod.HapInitResult;
 
 // Re-export format types used in public API
 pub const Vcsq = format.Vcsq;
@@ -101,6 +109,23 @@ pub const VcfRecord = struct {
     pub fn seqname(self: *const VcfRecord) []const u8 {
         return self.chr;
     }
+
+    /// Return the chromosome name as a null-terminated pointer.
+    /// The underlying `chr` slice is expected to originate from a
+    /// null-terminated source (e.g. VCF header seqname).  If it does
+    /// not end with a sentinel zero we fall back to a comptime default.
+    pub fn chrZ(self: *const VcfRecord) [*:0]const u8 {
+        // Try to reinterpret the existing slice as sentinel-terminated.
+        // This works when chr came from std.mem.span on a [*:0]const u8
+        // because the sentinel byte sits right after chr.len.
+        if (self.chr.len > 0) {
+            const ptr = self.chr.ptr;
+            if (ptr[self.chr.len] == 0) {
+                return ptr[0..self.chr.len :0];
+            }
+        }
+        return "unknown";
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -119,6 +144,10 @@ pub const Vrec = struct {
     vcsqs: std.ArrayList(Vcsq) = .empty,
 
     pub fn deinit(self: *Vrec, allocator: std.mem.Allocator) void {
+        // Free any owned vstr strings in consequences
+        for (self.vcsqs.items) |vcsq| {
+            if (vcsq.vstr) |vs| allocator.free(vs);
+        }
         self.vcsqs.deinit(allocator);
         if (self.fmt_bm) |bm| {
             allocator.free(bm);
@@ -242,9 +271,36 @@ fn RingBuffer(comptime T: type) type {
 // Options
 // ---------------------------------------------------------------------------
 
+/// Opaque type-erased pointer to an HtsFaidx instance (from vcf/htslib.zig).
+/// Stored as `*anyopaque` so that this module does not require htslib C headers
+/// at compile time.  The caller (main.zig) is responsible for opening the faidx
+/// and passing it in via Options.fai_ptr.
+///
+/// To perform a reference fetch through this pointer, use `faidxFetchSeq` below
+/// which casts back to the concrete HtsFaidx type via the htslib module.
+pub const FaidxPtr = *anyopaque;
+
+/// Function pointer type for fetching a reference sequence region.
+/// This abstracts over the concrete htslib faidx so the pipeline can be
+/// tested without linking htslib.
+///
+/// Parameters:
+///   ctx      — opaque context (e.g. FaidxPtr)
+///   chr      — chromosome name (null-terminated)
+///   beg, end — 0-based, inclusive coordinates
+///
+/// Returns the fetched sequence as an owned slice, or null on failure.
+pub const FetchSeqFn = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, chr: [*:0]const u8, beg: i64, end: i64) ?[]u8;
+
 pub const Options = struct {
     gff_fname: []const u8,
     fasta_fname: []const u8 = "",
+    /// Opaque pointer to an opened HtsFaidx.  May be null when running without
+    /// htslib (text-only testing path).
+    fai_ptr: ?FaidxPtr = null,
+    /// Optional function for fetching reference sequences.  When non-null this
+    /// is called instead of going through fai_ptr directly, allowing test stubs.
+    fetch_seq_fn: ?FetchSeqFn = null,
     phase: Phase = .require,
     local_csq: bool = false,
     verbosity: i32 = 1,
@@ -268,6 +324,11 @@ pub const CsqContext = struct {
     // Haplotype processing — TODO: wire haplotype.HapContext
     // hap_ctx: haplotype.HapContext,
 
+    // FASTA reference access
+    fasta_fname: []const u8,
+    fai_ptr: ?FaidxPtr,
+    fetch_seq_fn: ?FetchSeqFn,
+
     // VCF record buffering
     pos2vbuf: std.AutoHashMap(u32, usize), // pos -> ring buffer index (for existence check)
     vcf_rbuf: RingBuffer(*Vbuf),
@@ -281,6 +342,9 @@ pub const CsqContext = struct {
 
     // Output
     output: std.ArrayList(u8),
+
+    // Flushed records — populated by vbufFlush, consumed by the caller
+    flushed_records: std.ArrayList(FlushedRecord) = .empty,
 
     // Options
     phase: Phase,
@@ -297,9 +361,9 @@ pub const CsqContext = struct {
     prev_rid: i32,
     prev_pos: i32,
 
-    // Warnings (emit once)
-    warned_faidx_fetch_failed: bool,
-    warned_ref_allele_mismatch: bool,
+    // Warnings (emit once, count for verbosity > 1)
+    warned_faidx_fetch_failed: u32,
+    warned_ref_allele_mismatch: u32,
 
     /// Initialize the CSQ context with the given options.
     ///
@@ -313,10 +377,14 @@ pub const CsqContext = struct {
         return CsqContext{
             .allocator = allocator,
             .gff = null,
+            .fasta_fname = options.fasta_fname,
+            .fai_ptr = options.fai_ptr,
+            .fetch_seq_fn = options.fetch_seq_fn,
             .pos2vbuf = std.AutoHashMap(u32, usize).init(allocator),
             .vcf_rbuf = try RingBuffer(*Vbuf).init(allocator, 64),
             .csq_buf = .empty,
             .output = .empty,
+            .flushed_records = .empty,
             .phase = options.phase,
             .local_csq = options.local_csq,
             .verbosity = options.verbosity,
@@ -328,8 +396,8 @@ pub const CsqContext = struct {
             .current_rid = -1,
             .prev_rid = -1,
             .prev_pos = -1,
-            .warned_faidx_fetch_failed = false,
-            .warned_ref_allele_mismatch = false,
+            .warned_faidx_fetch_failed = 0,
+            .warned_ref_allele_mismatch = 0,
         };
     }
 
@@ -345,6 +413,300 @@ pub const CsqContext = struct {
         self.pos2vbuf.deinit();
         self.csq_buf.deinit(self.allocator);
         self.output.deinit(self.allocator);
+        // Free any duped bcsq_value strings in flushed records
+        for (self.flushed_records.items) |fr| {
+            if (fr.bcsq_value) |bv| self.allocator.free(bv);
+        }
+        self.flushed_records.deinit(self.allocator);
+    }
+
+
+    // -----------------------------------------------------------------
+    // FASTA reference — fetch, init, splice, sanity check
+    // -----------------------------------------------------------------
+
+    /// Fetch a reference sequence region via the configured faidx.
+    ///
+    /// Returns the sequence as an owned slice, or null if no faidx is
+    /// available or the fetch fails.
+    fn fetchRefSeq(self: *CsqContext, chr: [*:0]const u8, beg: i64, end: i64) ?[]u8 {
+        // Use the function-pointer path (allows test stubs and htslib wrappers)
+        if (self.fetch_seq_fn) |fetch_fn| {
+            if (self.fai_ptr) |fai| {
+                return fetch_fn(fai, self.allocator, chr, beg, end);
+            }
+        }
+        // No faidx available — running without htslib
+        return null;
+    }
+
+    /// Uppercase a byte slice in-place (ASCII only).
+    fn uppercaseInPlace(seq: []u8) void {
+        for (seq) |*c| {
+            if (c.* >= 'a' and c.* <= 'z') c.* -= 32;
+        }
+    }
+
+    /// Initialize the reference sequence for a transcript.
+    ///
+    /// Port of tscript_init_ref() from csq.c (line 2797).
+    /// Fetches the genomic region [tr.beg - N_REF_PAD, tr.end + N_REF_PAD]
+    /// from the FASTA reference and stores it in tscript.ref_seq.  If the
+    /// transcript is close to the start of the chromosome, the left padding
+    /// is filled with 'N' characters.
+    ///
+    /// Returns error.FaidxFetchFailed if the sequence cannot be fetched and
+    /// --force is not set; returns error.FaidxSkipped if --force is set and
+    /// the fetch fails (caller should skip this transcript).
+    pub fn tscriptInitRef(self: *CsqContext, tr: *Transcript, chr: [*:0]const u8) !void {
+        const tscript = try self.getOrCreateTscript(tr);
+
+        const pad: u32 = N_REF_PAD;
+        const pad_beg: u32 = if (tr.beg >= pad) pad else tr.beg;
+        const beg: i64 = @as(i64, @intCast(tr.beg)) - @as(i64, @intCast(pad_beg));
+        const end: i64 = @as(i64, @intCast(tr.end)) + @as(i64, @intCast(pad));
+
+        const raw_seq = self.fetchRefSeq(chr, beg, end) orelse {
+            // Fetch failed
+            if (!self.force) {
+                std.log.err("unable to fetch the region of the fasta reference {s}:{d}-{d}", .{
+                    std.mem.span(chr), tr.beg + 1, tr.end + 1,
+                });
+                return error.FaidxFetchFailed;
+            }
+            if (self.verbosity > 0 and (self.warned_faidx_fetch_failed == 0 or self.verbosity > 1)) {
+                std.log.warn("unable to fetch the region of the fasta reference {s}:{d}-{d}", .{
+                    std.mem.span(chr), tr.beg + 1, tr.end + 1,
+                });
+                if (self.verbosity < 2) {
+                    std.log.warn("This message is printed only once, the verbosity can be increased with `--verbosity 2`", .{});
+                }
+            }
+            self.warned_faidx_fetch_failed += 1;
+            return error.FaidxSkipped;
+        };
+        defer self.allocator.free(raw_seq);
+
+        const raw_len: u32 = @intCast(raw_seq.len);
+        const tr_len: u32 = tr.end - tr.beg + 1;
+
+        // Determine actual padding achieved on each side
+        const pad_end: u32 = if (raw_len > tr_len + pad_beg) raw_len - tr_len - pad_beg else 0;
+
+        // If we got full padding on both sides, use the sequence directly
+        if (pad_beg == pad and pad_end == pad) {
+            tscript.ref_seq = try self.allocator.alloc(u8, raw_seq.len);
+            @memcpy(tscript.ref_seq.?, raw_seq);
+        } else {
+            // Need to pad with N characters to reach N_REF_PAD on each side
+            const total_len: usize = tr_len + 2 * pad;
+            const ref = try self.allocator.alloc(u8, total_len);
+
+            // Left N-padding
+            const left_pad = pad - pad_beg;
+            @memset(ref[0..left_pad], 'N');
+            var pos: usize = left_pad;
+
+            // Copy the fetched sequence
+            @memcpy(ref[pos .. pos + raw_seq.len], raw_seq);
+            pos += raw_seq.len;
+
+            // Right N-padding
+            const right_pad = pad - pad_end;
+            if (pos + right_pad <= ref.len) {
+                @memset(ref[pos .. pos + right_pad], 'N');
+            }
+
+            tscript.ref_seq = ref;
+        }
+
+        // Uppercase the entire reference
+        if (tscript.ref_seq) |ref| {
+            uppercaseInPlace(ref);
+        }
+    }
+
+    /// Build the spliced reference sequence from the genomic reference and CDS entries.
+    ///
+    /// Port of tscript_splice_ref() from csq.c (line 1971).
+    /// Concatenates N_REF_PAD bases of upstream context, all CDS segments,
+    /// and N_REF_PAD bases of downstream context into tscript.sref.
+    pub fn tscriptSpliceRef(self: *CsqContext, tr: *Transcript) !void {
+        const tscript = self.getTscript(tr) orelse return error.TscriptNotInitialized;
+        const ref = tscript.ref_seq orelse return error.RefNotLoaded;
+
+        if (tr.cds.items.len == 0) return error.NoCdsEntries;
+
+        // Total spliced length = sum of CDS lengths + 2 * N_REF_PAD
+        var cds_total_len: u32 = 0;
+        for (tr.cds.items) |cds| {
+            cds_total_len += cds.len;
+        }
+
+        const pad: u32 = N_REF_PAD;
+        const total_len: usize = cds_total_len + 2 * pad;
+        const sref = try self.allocator.alloc(u8, total_len);
+
+        var pos: usize = 0;
+
+        // Copy N_REF_PAD bases upstream of the first CDS.
+        // In the genomic ref, the first CDS starts at offset (cds[0].beg - tr.beg + N_REF_PAD).
+        // We want N_REF_PAD bases before that: offset (cds[0].beg - tr.beg).
+        const first_cds = tr.cds.items[0];
+        const first_offset = first_cds.beg - tr.beg;
+        if (first_offset + pad <= ref.len) {
+            @memcpy(sref[0..pad], ref[first_offset .. first_offset + pad]);
+        }
+        pos = pad;
+
+        // Copy each CDS segment from the genomic reference
+        for (tr.cds.items) |cds| {
+            const cds_offset: usize = pad + cds.beg - tr.beg;
+            if (cds_offset + cds.len <= ref.len) {
+                @memcpy(sref[pos .. pos + cds.len], ref[cds_offset .. cds_offset + cds.len]);
+            }
+            pos += cds.len;
+        }
+
+        // Copy N_REF_PAD bases downstream of the last CDS
+        const last_cds = tr.cds.items[tr.cds.items.len - 1];
+        const last_offset: usize = pad + last_cds.beg - tr.beg + last_cds.len;
+        if (last_offset + pad <= ref.len) {
+            @memcpy(sref[pos .. pos + pad], ref[last_offset .. last_offset + pad]);
+        }
+
+        tscript.sref = sref;
+        tscript.nsref = @intCast(total_len);
+    }
+
+    /// Verify that the VCF REF allele matches the FASTA reference.
+    ///
+    /// Port of sanity_check_ref() from csq.c (line 2840).
+    /// Returns error.RefAlleleMismatch on mismatch when --force is not set.
+    /// Returns error.RefMismatchSkipped when --force is set (caller should
+    /// skip this variant).  Returns success (void) on match.
+    pub fn sanityCheckRef(self: *CsqContext, tr: *Transcript, rec: *const VcfRecord) !void {
+        const tscript = self.getTscript(tr) orelse return error.TscriptNotInitialized;
+        const ref = tscript.ref_seq orelse return error.RefNotLoaded;
+
+        if (rec.alleles.len == 0) return;
+        const vcf_ref = rec.alleles[0];
+        if (vcf_ref.len == 0) return;
+
+        // Calculate offset into the padded reference
+        var vbeg: usize = 0;
+        var rbeg_signed: i64 = @as(i64, @intCast(rec.pos)) - @as(i64, @intCast(tr.beg)) + @as(i64, N_REF_PAD);
+        if (rbeg_signed < 0) {
+            vbeg = @intCast(-rbeg_signed);
+            rbeg_signed = 0;
+        }
+        const rbeg: usize = @intCast(rbeg_signed);
+
+        if (rbeg >= ref.len or vbeg >= vcf_ref.len) return;
+
+        // Compare character by character
+        var i: usize = 0;
+        while (rbeg + i < ref.len and vbeg + i < vcf_ref.len) : (i += 1) {
+            const rc = std.ascii.toUpper(ref[rbeg + i]);
+            const vc = std.ascii.toUpper(vcf_ref[vbeg + i]);
+            if (rc != vc) {
+                if (!self.force) {
+                    std.log.err("the fasta reference does not match the VCF REF allele at {s}:{d} .. fasta={c} vcf={c}", .{
+                        rec.seqname(), rec.pos + @as(u32, @intCast(vbeg)) + 1, rc, vc,
+                    });
+                    return error.RefAlleleMismatch;
+                }
+
+                if (self.verbosity > 0 and (self.warned_ref_allele_mismatch == 0 or self.verbosity > 1)) {
+                    std.log.warn("the fasta reference does not match the VCF REF allele at {s}:{d} .. fasta={c} vcf={c}", .{
+                        rec.seqname(), rec.pos + @as(u32, @intCast(vbeg)) + 1, rc, vc,
+                    });
+                    if (self.verbosity < 2) {
+                        std.log.warn("This message is printed only once, the verbosity can be increased with `--verbosity 2`", .{});
+                    }
+                }
+                self.warned_ref_allele_mismatch += 1;
+                return error.RefMismatchSkipped;
+            }
+        }
+    }
+
+    /// Get the Tscript auxiliary data for a transcript, or null if not yet initialized.
+    fn getTscript(self: *CsqContext, tr: *Transcript) ?*Tscript {
+        _ = self;
+        const aux = tr.aux orelse return null;
+        return @as(*Tscript, @ptrCast(@alignCast(aux)));
+    }
+
+    /// Get or create the Tscript auxiliary data for a transcript.
+    fn getOrCreateTscript(self: *CsqContext, tr: *Transcript) !*Tscript {
+        if (tr.aux) |aux| {
+            return @as(*Tscript, @ptrCast(@alignCast(aux)));
+        }
+        const tscript = try self.allocator.create(Tscript);
+        tscript.* = .{};
+        tr.aux = tscript;
+        return tscript;
+    }
+
+    /// Initialize transcript auxiliary data: fetch reference, build spliced
+    /// reference, and create the haplotype tree root node.
+    ///
+    /// This is the entry point called from testCds/testCdsLocal when a
+    /// transcript is first encountered.  Corresponds to the transcript
+    /// initialization block in test_cds() / test_cds_local() in csq.c.
+    ///
+    /// Errors from faidx fetch are propagated; the caller decides whether
+    /// to skip the transcript or abort.
+    pub fn initTranscriptAux(self: *CsqContext, tr: *Transcript, chr: [*:0]const u8) !void {
+        // Already initialized?
+        if (self.getTscript(tr)) |ts| {
+            if (ts.ref_seq != null) return;
+        }
+
+        // 1. Fetch genomic reference around the transcript
+        try self.tscriptInitRef(tr, chr);
+
+        // 2. Build the spliced reference from CDS segments
+        if (tr.cds.items.len > 0) {
+            self.tscriptSpliceRef(tr) catch |err| {
+                std.log.warn("failed to build spliced reference for transcript {d}: {}", .{ tr.id, err });
+            };
+        }
+
+        // 3. Create the haplotype tree root node
+        const tscript = self.getTscript(tr).?;
+        if (tscript.root == null) {
+            const root = try self.allocator.create(HapNode);
+            root.* = HapNode.init(.root);
+            tscript.root = root;
+        }
+    }
+
+    /// Free transcript auxiliary data (Tscript and its owned allocations).
+    ///
+    /// Called when a transcript is removed from the active set (after all
+    /// overlapping variants have been processed and flushed).
+    pub fn destroyTranscriptAux(self: *CsqContext, tr: *Transcript) void {
+        const tscript = self.getTscript(tr) orelse return;
+
+        if (tscript.ref_seq) |ref| {
+            self.allocator.free(ref);
+            tscript.ref_seq = null;
+        }
+        if (tscript.sref) |sref| {
+            self.allocator.free(sref);
+            tscript.sref = null;
+        }
+        if (tscript.root) |root| {
+            root.deinit(self.allocator);
+            self.allocator.destroy(root);
+            tscript.root = null;
+        }
+        tscript.hap.deinit(self.allocator);
+
+        self.allocator.destroy(tscript);
+        tr.aux = null;
     }
 
     // -----------------------------------------------------------------
@@ -387,11 +749,34 @@ pub const CsqContext = struct {
     // vbufFlush — flush records up to a position
     // -----------------------------------------------------------------
 
+    /// A flushed record with an optional BCSQ annotation string.
+    /// Callers (e.g. writeVcfRecord in main.zig) iterate flushed_records
+    /// after each vbufFlush call and inject the BCSQ value into the VCF
+    /// line before writing.
+    pub const FlushedRecord = struct {
+        /// The original VCF record (pipeline type).
+        rec: *const VcfRecord,
+        /// Formatted BCSQ value, e.g. "missense|GENE|TR|protein_coding|+|5T>5I|100A>G".
+        /// Null means no consequences — write the record as-is.
+        bcsq_value: ?[]const u8 = null,
+        /// Per-sample FORMAT/BCSQ bitmask integers (interleaved first/second haplotype).
+        /// Null means no sample annotation.
+        fmt_bm: ?[]const u32 = null,
+        /// Number of FORMAT integers per sample.
+        nfmt: u32 = 0,
+    };
+
     /// Flush all buffered VCF records whose keep_until <= pos.
-    /// Formats BCSQ strings and writes output.
+    /// Formats BCSQ strings and populates flushed_records.
     ///
     /// Port of vbuf_flush() from csq.c (line 2715).
     pub fn vbufFlush(self: *CsqContext, pos: u32) !void {
+        // Free duped bcsq_value strings from previous flush before clearing
+        for (self.flushed_records.items) |fr| {
+            if (fr.bcsq_value) |bv| self.allocator.free(bv);
+        }
+        self.flushed_records.clearRetainingCapacity();
+
         while (self.vcf_rbuf.len > 0) {
             const vbuf = self.vcf_rbuf.front().?;
 
@@ -407,9 +792,13 @@ pub const CsqContext = struct {
 
             // Format consequences for each record in the vbuf
             for (vbuf.vrecs.items) |*vrec| {
+                const rec_ptr = vrec.rec orelse continue;
+
                 if (vrec.vcsqs.items.len == 0) {
-                    // No consequences — in VCF mode we'd write the record as-is.
-                    // TODO: write unmodified record via htslib
+                    // No consequences — record passes through unmodified
+                    try self.flushed_records.append(self.allocator, .{
+                        .rec = rec_ptr,
+                    });
                     continue;
                 }
 
@@ -421,9 +810,15 @@ pub const CsqContext = struct {
                     self.output.writer(self.allocator),
                 );
 
-                // TODO: bcf_update_info_string(hdr, rec, bcsq_tag, output)
-                // TODO: bcf_update_format_int32(hdr, rec, bcsq_tag, fmt_bm, ...)
-                // TODO: bcf_write(out_fh, hdr, rec)
+                // Dupe the formatted string so it outlives the output buffer reuse
+                const bcsq_str = try self.allocator.dupe(u8, self.output.items);
+
+                try self.flushed_records.append(self.allocator, .{
+                    .rec = rec_ptr,
+                    .bcsq_value = bcsq_str,
+                    .fmt_bm = vrec.fmt_bm,
+                    .nfmt = vrec.nfmt,
+                });
             }
 
             vbuf.deinit(self.allocator);
@@ -572,30 +967,131 @@ pub const CsqContext = struct {
             if (vbuf.keep_until < tr.end) vbuf.keep_until = tr.end;
             ret = true;
 
-            // TODO: Initialize transcript aux if first time:
-            //   - tscript_init_ref: fetch reference sequence from fasta
-            //   - Create haplotype tree root node
-            //   - Add to active_transcripts heap
-            // TODO: sanity_check_ref: verify VCF REF matches fasta
+            // Initialize transcript aux if first time
+            if (tr.aux == null) {
+                const taux = try self.allocator.create(Tscript);
+                taux.* = .{};
+                tr.aux = taux;
+                // Create haplotype tree root node
+                const root = try self.allocator.create(HapNode);
+                root.* = HapNode.init(.root);
+                taux.root = root;
+                const nhap: u32 = if (self.phase == .drop_gt) 1 else 2;
+                root.nend = nhap;
+                // Fetch the FASTA reference for this transcript (if faidx available)
+                self.tscriptInitRef(tr, rec.chrZ()) catch |err| switch (err) {
+                    error.FaidxSkipped => {
+                        // --force: skip this transcript, clean up aux
+                        root.deinit(self.allocator);
+                        self.allocator.destroy(root);
+                        self.allocator.destroy(taux);
+                        tr.aux = null;
+                        continue;
+                    },
+                    error.FaidxFetchFailed => {
+                        // No fasta: clean up aux and skip (matches C: free(tr->aux); tr->aux=NULL; continue)
+                        root.deinit(self.allocator);
+                        self.allocator.destroy(root);
+                        self.allocator.destroy(taux);
+                        tr.aux = null;
+                        continue;
+                    },
+                    else => return err,
+                };
+                // Build the spliced reference from CDS segments
+                self.tscriptSpliceRef(tr) catch {};
+                // TODO: add to active_transcripts heap
+            }
+
+            const taux_ptr: *Tscript = @ptrCast(@alignCast(tr.aux orelse continue));
+            // Verify VCF REF allele matches the FASTA reference
+            self.sanityCheckRef(tr, rec) catch |err| switch (err) {
+                error.RefMismatchSkipped => continue,
+                error.RefAlleleMismatch => return err,
+                error.TscriptNotInitialized, error.RefNotLoaded => {},
+                else => return err,
+            };
 
             if (self.phase == .drop_gt) {
                 // Simplified path: single haplotype, no genotype tracking.
-                // Skip symbolic/star alleles.
                 if (rec.alleles.len < 2) continue;
                 const alt = rec.alleles[1];
                 if (alt.len > 0 and (alt[0] == '<' or alt[0] == '*')) continue;
 
-                // TODO: Full implementation requires:
-                //   - hap_init to create child node from parent
-                //   - If HAP_SSS: stage splice consequence directly
-                //   - Otherwise: attach child to haplotype tree
-                // For now, we mark the hit so downstream tests (UTR/intron) are skipped.
+                // Get current leaf or root
+                const parent: *HapNode = if (taux_ptr.hap.items.len > 0)
+                    taux_ptr.hap.items[0]
+                else
+                    (taux_ptr.root orelse continue);
+
+                var child = try self.allocator.create(HapNode);
+                child.* = HapNode.init(.cds);
+                const ref_allele = rec.alleles[0];
+
+                const hap_ret = haplotype_mod.hapInit(
+                    self.allocator,
+                    parent,
+                    child,
+                    cds,
+                    rec.pos,
+                    ref_allele,
+                    alt,
+                    1,
+                    taux_ptr,
+                ) catch {
+                    self.allocator.destroy(child);
+                    continue;
+                };
+
+                switch (hap_ret) {
+                    .overlapping => {
+                        child.deinit(self.allocator);
+                        self.allocator.destroy(child);
+                        continue;
+                    },
+                    .discarded => {
+                        child.deinit(self.allocator);
+                        self.allocator.destroy(child);
+                        ret = true;
+                        continue;
+                    },
+                    .added => {},
+                }
+
+                // Splice-only (HAP_SSS): stage the splice consequence directly
+                if (child.payload == .sss) {
+                    var csq = Csq{
+                        .pos = rec.pos,
+                        .vcsq = .{
+                            .csq_type = child.csq.toInt(),
+                            .biotype = @intFromEnum(tr.biotype),
+                            .strand = if (tr.strand == .forward) .fwd else .rev,
+                            .trid = tr.id,
+                            .vcf_ial = 1,
+                            .gene = if (tr.gene) |g| @as(?[]const u8, if (g.name) |n| std.mem.span(n) else null) else null,
+                        },
+                    };
+                    try self.csqStage(&csq, rec);
+                    child.deinit(self.allocator);
+                    self.allocator.destroy(child);
+                    ret = true;
+                    continue;
+                }
+
+                // Attach child to parent in the haplotype tree
+                parent.nend -= 1;
+                try parent.children.append(self.allocator, child);
+                if (taux_ptr.hap.items.len == 0) {
+                    try taux_ptr.hap.append(self.allocator, child);
+                } else {
+                    taux_ptr.hap.items[0] = child;
+                }
+                taux_ptr.hap.items[0].nend = 1;
                 continue;
             }
 
-            // TODO: Full sample-aware haplotype extension:
-            //   - bcf_get_genotypes per sample
-            //   - For each het/hom-alt, extend the haplotype tree leaf
+            // Full sample-aware haplotype extension requires htslib genotype access.
+            // TODO: implement bcf_get_genotypes loop per sample/haplotype
         }
         return ret;
     }
@@ -612,6 +1108,16 @@ pub const CsqContext = struct {
 
         var itr = gff.idx_cds.overlap(chr, rec.pos, rec.pos + rec.rlen);
 
+        // Working buffers for translation (reused across iterations)
+        var tref_buf: std.ArrayList(u8) = .empty;
+        defer tref_buf.deinit(self.allocator);
+        var tseq_buf: std.ArrayList(u8) = .empty;
+        defer tseq_buf.deinit(self.allocator);
+        var tref_stop_buf: std.ArrayList(u8) = .empty;
+        defer tref_stop_buf.deinit(self.allocator);
+        var tseq_stop_buf: std.ArrayList(u8) = .empty;
+        defer tseq_stop_buf.deinit(self.allocator);
+
         var ret = false;
         while (itr.next()) |interval| {
             const cds: *CdsEntry = interval.payload;
@@ -619,8 +1125,33 @@ pub const CsqContext = struct {
             if (!tr.biotype.isCoding()) continue;
             ret = true;
 
-            // TODO: Initialize transcript aux if first time (tscript_init_ref)
-            // TODO: sanity_check_ref
+            // Initialize transcript aux if first time
+            if (tr.aux == null) {
+                const taux_new = try self.allocator.create(Tscript);
+                taux_new.* = .{};
+                tr.aux = taux_new;
+                // Fetch FASTA reference and build spliced reference
+                self.tscriptInitRef(tr, rec.chrZ()) catch |err| switch (err) {
+                    error.FaidxSkipped, error.FaidxFetchFailed => {
+                        // No fasta: clean up aux (matches C: free(tr->aux); tr->aux=NULL; continue)
+                        self.allocator.destroy(taux_new);
+                        tr.aux = null;
+                        continue;
+                    },
+                    else => return err,
+                };
+                self.tscriptSpliceRef(tr) catch {};
+                // TODO: add to active_transcripts heap
+            }
+
+            const taux: *Tscript = @ptrCast(@alignCast(tr.aux orelse continue));
+            // Verify VCF REF allele matches the FASTA reference
+            self.sanityCheckRef(tr, rec) catch |err| switch (err) {
+                error.RefMismatchSkipped => continue,
+                error.RefAlleleMismatch => return err,
+                error.TscriptNotInitialized, error.RefNotLoaded => {},
+                else => return err,
+            };
 
             // For each alt allele
             var ial: u32 = 1;
@@ -629,20 +1160,36 @@ pub const CsqContext = struct {
                 const alt = rec.alleles[ial];
                 if (alt.len > 0 and (alt[0] == '<' or alt[0] == '*')) continue;
 
-                // TODO: Full implementation requires:
-                //   - hap_init with a temporary root to get a single-variant node
-                //   - If HAP_SSS: stage the splice consequence via csqStage
-                //   - Otherwise: translate ref and alt CDS, compare amino acids,
-                //     determine missense/synonymous/stop_gained/frameshift/etc.
-                //   - Build variant string and call csqStage
+                const ref_allele = rec.alleles[0];
 
-                // For now, stage a coding_sequence consequence as a placeholder
-                // to indicate we found a CDS hit. This ensures the cascade
-                // correctly skips UTR/intron tests.
+                // Use a temporary root to do single-variant hapInit
+                var tmp_root = HapNode.init(.root);
+                defer tmp_root.deinit(self.allocator);
+                var node = HapNode.init(.cds);
+
+                const hap_ret = haplotype_mod.hapInit(
+                    self.allocator,
+                    &tmp_root,
+                    &node,
+                    cds,
+                    rec.pos,
+                    ref_allele,
+                    alt,
+                    ial,
+                    taux,
+                ) catch continue;
+
+                if (hap_ret != .added) continue;
+                defer {
+                    if (node.payload == .cds) {
+                        if (node.payload.cds.seq) |seq| self.allocator.free(seq);
+                    }
+                    if (node.var_str) |vs| self.allocator.free(vs);
+                }
+
                 var csq = Csq{
                     .pos = rec.pos,
                     .vcsq = .{
-                        .csq_type = CSQ_CODING_SEQUENCE,
                         .biotype = @intFromEnum(tr.biotype),
                         .strand = if (tr.strand == .forward) .fwd else .rev,
                         .trid = tr.id,
@@ -650,7 +1197,162 @@ pub const CsqContext = struct {
                         .gene = if (tr.gene) |g| @as(?[]const u8, if (g.name) |n| std.mem.span(n) else null) else null,
                     },
                 };
-                try self.csqStage(&csq, rec);
+
+                var csq_type: u32 = node.csq.toInt();
+
+                // Splice-only node (HAP_SSS): stage directly
+                if (node.payload == .sss) {
+                    csq.vcsq.csq_type = csq_type;
+                    try self.csqStage(&csq, rec);
+                    continue;
+                }
+
+                // CDS node: translate ref and alt, compare amino acids
+                const sref = taux.sref orelse {
+                    // No spliced reference available; fall back to coding_sequence
+                    csq.vcsq.csq_type = CSQ_CODING_SEQUENCE;
+                    try self.csqStage(&csq, rec);
+                    continue;
+                };
+                const sref_len: usize = @intCast(taux.nsref);
+                const gencode = translate.findGeneticCode(0) orelse {
+                    csq.vcsq.csq_type = CSQ_CODING_SEQUENCE;
+                    try self.csqStage(&csq, rec);
+                    continue;
+                };
+
+                // Translate the alt allele
+                const node_seq = if (node.payload == .cds) node.payload.cds.seq else null;
+                const alen: usize = if (node_seq) |s| s.len else 0;
+                const fill_val: i32 = if (@rem(node.dlen, 3) != 0 and alen > 0) 1 else 0;
+
+                haplotype_mod.cdsTranslate(
+                    self.allocator,
+                    sref,
+                    sref_len,
+                    node_seq orelse &[_]u8{},
+                    if (sref_len >= 2 * N_REF_PAD) sref_len - 2 * N_REF_PAD + @as(usize, @intCast(@max(node.dlen, 0))) else 0,
+                    node.sbeg,
+                    node.sbeg,
+                    node.sbeg + @as(u32, @intCast(@max(@as(i32, 0), node.rlen))),
+                    tr.strand,
+                    &tseq_buf,
+                    &tseq_stop_buf,
+                    fill_val,
+                    gencode,
+                ) catch {
+                    csq.vcsq.csq_type = CSQ_CODING_SEQUENCE;
+                    try self.csqStage(&csq, rec);
+                    continue;
+                };
+
+                // Translate the reference
+                {
+                    const ref_start = N_REF_PAD + node.sbeg;
+                    const ref_len_u: u32 = @intCast(@max(@as(i32, 0), node.rlen));
+                    const ref_slice = if (ref_start + ref_len_u <= sref.len)
+                        sref[ref_start .. ref_start + ref_len_u]
+                    else
+                        &[_]u8{};
+
+                    haplotype_mod.cdsTranslate(
+                        self.allocator,
+                        sref,
+                        sref_len,
+                        ref_slice,
+                        if (sref_len >= 2 * N_REF_PAD) sref_len - 2 * N_REF_PAD else 0,
+                        node.sbeg,
+                        node.sbeg,
+                        node.sbeg + ref_len_u,
+                        tr.strand,
+                        &tref_buf,
+                        &tref_stop_buf,
+                        fill_val,
+                        gencode,
+                    ) catch {
+                        csq.vcsq.csq_type = CSQ_CODING_SEQUENCE;
+                        try self.csqStage(&csq, rec);
+                        continue;
+                    };
+                }
+
+                // Use hapAddCsq to determine the consequence type
+                const csq_result = haplotype_mod.hapAddCsq(
+                    tref_buf.items,
+                    tref_stop_buf.items,
+                    tseq_buf.items,
+                    tseq_stop_buf.items,
+                    node.dlen,
+                    node.dlen != 0,
+                    types.CsqType.fromInt(csq_type),
+                    false, // not sss
+                    false, // not compound (single variant)
+                    false, // no upstream stop
+                );
+                csq_type = csq_result.csq_type.toInt();
+
+                // Stage compound consequences (with variant string)
+                if (csq_type & format.CSQ_COMPOUND != 0) {
+                    var vstr_buf = std.ArrayList(u8).empty;
+                    defer vstr_buf.deinit(self.allocator);
+
+                    const aa_rbeg: usize = if (tr.strand == .forward)
+                        node.sbeg / 3 + 1
+                    else blk: {
+                        const nsref_coding = if (sref_len >= 2 * N_REF_PAD) sref_len - 2 * N_REF_PAD else 0;
+                        const rlen_u: usize = @intCast(@max(@as(i32, 0), node.rlen));
+                        break :blk (nsref_coding -| node.sbeg -| rlen_u) / 3 + 1;
+                    };
+
+                    try vstr_buf.append(self.allocator, '|');
+                    {
+                        var num_buf: [32]u8 = undefined;
+                        const s = std.fmt.bufPrint(&num_buf, "{d}", .{aa_rbeg}) catch unreachable;
+                        try vstr_buf.appendSlice(self.allocator, s);
+                    }
+                    try vstr_buf.appendSlice(self.allocator, tref_buf.items);
+                    if (csq_type & CSQ_SYNONYMOUS_VARIANT == 0) {
+                        try vstr_buf.append(self.allocator, '>');
+                        const aa_sbeg: usize = if (tr.strand == .forward)
+                            node.sbeg / 3 + 1
+                        else blk: {
+                            const nsref_coding_dlen = if (sref_len >= 2 * N_REF_PAD)
+                                @as(i64, @intCast(sref_len - 2 * N_REF_PAD)) + node.dlen
+                            else
+                                @as(i64, node.dlen);
+                            break :blk @as(usize, @intCast(@max(nsref_coding_dlen - @as(i64, @intCast(node.sbeg)) - @as(i64, @intCast(alen)), 0))) / 3 + 1;
+                        };
+                        var num_buf: [32]u8 = undefined;
+                        const s = std.fmt.bufPrint(&num_buf, "{d}", .{aa_sbeg}) catch unreachable;
+                        try vstr_buf.appendSlice(self.allocator, s);
+                        try vstr_buf.appendSlice(self.allocator, tseq_buf.items);
+                    }
+                    try vstr_buf.append(self.allocator, '|');
+                    {
+                        var num_buf: [32]u8 = undefined;
+                        const s = std.fmt.bufPrint(&num_buf, "{d}", .{rec.pos + 1}) catch unreachable;
+                        try vstr_buf.appendSlice(self.allocator, s);
+                    }
+                    if (node.var_str) |vs| try vstr_buf.appendSlice(self.allocator, vs);
+
+                    csq.vcsq.vstr = try self.allocator.dupe(u8, vstr_buf.items);
+                    csq.vcsq.csq_type = csq_type & format.CSQ_COMPOUND;
+                    try self.csqStage(&csq, rec);
+
+                    // Track vstr for cleanup
+                    if (taux.root == null) {
+                        const root = try self.allocator.create(HapNode);
+                        root.* = HapNode.init(.root);
+                        taux.root = root;
+                    }
+                }
+
+                // Stage non-compound consequences separately
+                if (csq_type & ~format.CSQ_COMPOUND != 0) {
+                    csq.vcsq.csq_type = csq_type & ~format.CSQ_COMPOUND;
+                    csq.vcsq.vstr = null;
+                    try self.csqStage(&csq, rec);
+                }
             }
         }
         return ret;
@@ -991,11 +1693,20 @@ pub const CsqContext = struct {
         const is_dup = try self.csqPush(csq, rec);
         if (is_dup and self.phase == .drop_gt) return;
 
-        // TODO: genotype-aware sample assignment
-        // 1. Get genotypes from the record
-        // 2. For each sample, check if the allele matches csq.vcsq.vcf_ial
-        // 3. For tab output: call csq_print_text
-        // 4. For VCF output: set bits in vrec.fmt_bm
+        if (self.phase == .drop_gt) {
+            // No genotype handling needed in drop_gt mode.
+            return;
+        }
+
+        // Genotype-aware sample assignment (requires htslib bcf_get_genotypes).
+        // TODO: When htslib bindings are available:
+        //   1. ngt = bcf_get_genotypes(hdr, rec, &gt_arr, &mgt_arr)
+        //   2. ngt /= bcf_hdr_nsamples(hdr)
+        //   3. if ngt <= 0: output with no sample, return
+        //   4. For tab output: iterate samples, check gt allele == vcf_ial,
+        //      call csq_print_text per matching sample/haplotype
+        //   5. For VCF output: iterate samples, for matching alleles set bits
+        //      in vrec.fmt_bm[sample * nfmt_bcsq + ival] |= (1 << ibit)
     }
 
     // -----------------------------------------------------------------
@@ -1015,6 +1726,108 @@ pub const CsqContext = struct {
         OutOfMemory,
     };
 };
+
+// ---------------------------------------------------------------------------
+// BCSQ injection into text VCF lines
+// ---------------------------------------------------------------------------
+
+/// Inject a BCSQ annotation into a text VCF line by appending `tag=value`
+/// to the INFO column (column index 7, 0-based).
+///
+/// If the INFO field is "." it is replaced entirely; otherwise the tag is
+/// appended with a semicolon separator.
+///
+/// Returns a newly-allocated line (without trailing newline).
+pub fn injectBcsq(
+    allocator: std.mem.Allocator,
+    original_line: []const u8,
+    bcsq_value: []const u8,
+    bcsq_tag: []const u8,
+) ![]u8 {
+    // Strip trailing newline/CR
+    var line = original_line;
+    if (line.len > 0 and line[line.len - 1] == '\n') line = line[0 .. line.len - 1];
+    if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+
+    // Find tab-delimited column boundaries.
+    // We need to locate column 7 (INFO).
+    var col_starts: [9]usize = undefined; // cols 0..8
+    var col_ends: [9]usize = undefined;
+    var col: usize = 0;
+    var start: usize = 0;
+    for (line, 0..) |c, i| {
+        if (c == '\t') {
+            if (col < 9) {
+                col_starts[col] = start;
+                col_ends[col] = i;
+            }
+            col += 1;
+            start = i + 1;
+            if (col >= 9) break;
+        }
+    }
+    // Handle last/remaining field
+    if (col < 9) {
+        col_starts[col] = start;
+        col_ends[col] = line.len;
+        col += 1;
+    }
+
+    if (col < 8) return error.TooFewColumns;
+
+    const info_start = col_starts[7];
+    const info_end = col_ends[7];
+    const info_field = line[info_start..info_end];
+
+    // Calculate result size
+    const is_dot = std.mem.eql(u8, info_field, ".");
+    const inject_len = bcsq_tag.len + 1 + bcsq_value.len; // "TAG=VALUE"
+    const separator: usize = if (is_dot) 0 else 1; // ";" before tag
+
+    const new_info_len = if (is_dot)
+        inject_len
+    else
+        info_field.len + separator + inject_len;
+
+    const result_len = line.len - info_field.len + new_info_len;
+    const result = try allocator.alloc(u8, result_len);
+
+    // Copy: [before INFO] [new INFO] [after INFO]
+    var pos: usize = 0;
+    // Everything up to (but not including) INFO content
+    @memcpy(result[pos .. pos + info_start], line[0..info_start]);
+    pos += info_start;
+
+    if (is_dot) {
+        // Replace "." with "TAG=VALUE"
+        @memcpy(result[pos .. pos + bcsq_tag.len], bcsq_tag);
+        pos += bcsq_tag.len;
+        result[pos] = '=';
+        pos += 1;
+        @memcpy(result[pos .. pos + bcsq_value.len], bcsq_value);
+        pos += bcsq_value.len;
+    } else {
+        // Keep existing INFO, append ";TAG=VALUE"
+        @memcpy(result[pos .. pos + info_field.len], info_field);
+        pos += info_field.len;
+        result[pos] = ';';
+        pos += 1;
+        @memcpy(result[pos .. pos + bcsq_tag.len], bcsq_tag);
+        pos += bcsq_tag.len;
+        result[pos] = '=';
+        pos += 1;
+        @memcpy(result[pos .. pos + bcsq_value.len], bcsq_value);
+        pos += bcsq_value.len;
+    }
+
+    // Copy everything after INFO (including trailing columns)
+    const after = line[info_end..];
+    @memcpy(result[pos .. pos + after.len], after);
+    pos += after.len;
+
+    std.debug.assert(pos == result_len);
+    return result;
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1186,7 +1999,12 @@ test "ncsq2ToNfmt calculation" {
 /// Helper: create a minimal GffParser with a single coding transcript on chr1
 /// spanning [100, 900], a CDS at [200, 400], an exon at [200, 400], a UTR5
 /// at [100, 199], and the transcript itself at [100, 900].
-fn makeTestGff(allocator: std.mem.Allocator) !*GffParser {
+const TestGff = struct {
+    gff: *GffParser,
+    tr: *Transcript,
+};
+
+fn makeTestGff(allocator: std.mem.Allocator) !TestGff {
     var gff = try allocator.create(GffParser);
     gff.* = GffParser.init(allocator);
     const arena = gff.arena.allocator();
@@ -1247,26 +2065,53 @@ fn makeTestGff(allocator: std.mem.Allocator) !*GffParser {
 
     try gff.idx_tscript.insert("chr1", 100, 900, tr);
 
-    return gff;
+    return .{ .gff = gff, .tr = tr };
 }
 
-fn destroyTestGff(allocator: std.mem.Allocator, gff: *GffParser) void {
-    gff.deinit();
-    allocator.destroy(gff);
+fn destroyTestGff(allocator: std.mem.Allocator, tgff: TestGff) void {
+    cleanupTranscriptAux(allocator, tgff.tr);
+    tgff.gff.deinit();
+    allocator.destroy(tgff.gff);
+}
+
+/// Clean up transcript aux data (Tscript + HapNode root + hap array)
+/// that was allocated by testCds/testCdsLocal during testing.
+fn cleanupTranscriptAux(allocator: std.mem.Allocator, tr: *Transcript) void {
+    if (tr.aux) |aux_raw| {
+        const taux: *Tscript = @ptrCast(@alignCast(aux_raw));
+        if (taux.root) |root| {
+            // Free children recursively (shallow: only direct children in test scenarios)
+            for (root.children.items) |child_node| {
+                if (child_node.payload == .cds) {
+                    if (child_node.payload.cds.seq) |seq| allocator.free(seq);
+                }
+                if (child_node.var_str) |vs| allocator.free(vs);
+                child_node.deinit(allocator);
+                allocator.destroy(child_node);
+            }
+            root.deinit(allocator);
+            allocator.destroy(root);
+        }
+        taux.hap.deinit(allocator);
+        allocator.destroy(taux);
+        tr.aux = null;
+    }
 }
 
 test "testCds: variant overlapping CDS is detected" {
     const allocator = std.testing.allocator;
 
-    const gff = try makeTestGff(allocator);
-    defer destroyTestGff(allocator, gff);
+    const tgff = try makeTestGff(allocator);
+    defer destroyTestGff(allocator, tgff);
 
     var ctx = try CsqContext.init(allocator, .{
         .gff_fname = "test.gff",
         .phase = .drop_gt,
+        .force = true,
+        .verbosity = 0,
     });
     defer ctx.deinit();
-    ctx.gff = gff;
+    ctx.gff = tgff.gff;
 
     const alleles = [_][]const u8{ "A", "T" };
     var rec = VcfRecord{
@@ -1289,15 +2134,15 @@ test "testCds: variant overlapping CDS is detected" {
 test "testCds: variant outside CDS is not detected" {
     const allocator = std.testing.allocator;
 
-    const gff = try makeTestGff(allocator);
-    defer destroyTestGff(allocator, gff);
+    const tgff = try makeTestGff(allocator);
+    defer destroyTestGff(allocator, tgff);
 
     var ctx = try CsqContext.init(allocator, .{
         .gff_fname = "test.gff",
         .phase = .drop_gt,
     });
     defer ctx.deinit();
-    ctx.gff = gff;
+    ctx.gff = tgff.gff;
 
     const alleles = [_][]const u8{ "A", "T" };
     // Position 500 is outside the CDS [200, 400]
@@ -1316,19 +2161,21 @@ test "testCds: variant outside CDS is not detected" {
     try std.testing.expect(!hit);
 }
 
-test "testCdsLocal: variant overlapping CDS stages coding_sequence" {
+test "testCdsLocal: variant overlapping CDS is detected (no fasta)" {
     const allocator = std.testing.allocator;
 
-    const gff = try makeTestGff(allocator);
-    defer destroyTestGff(allocator, gff);
+    const tgff = try makeTestGff(allocator);
+    defer destroyTestGff(allocator, tgff);
 
     var ctx = try CsqContext.init(allocator, .{
         .gff_fname = "test.gff",
         .phase = .drop_gt,
         .local_csq = true,
+        .force = true,
+        .verbosity = 0,
     });
     defer ctx.deinit();
-    ctx.gff = gff;
+    ctx.gff = tgff.gff;
 
     const alleles = [_][]const u8{ "A", "T" };
     var rec = VcfRecord{
@@ -1343,27 +2190,25 @@ test "testCdsLocal: variant overlapping CDS stages coding_sequence" {
     _ = try ctx.vbufPush(&rec);
     const hit = try ctx.testCdsLocal(&rec);
 
+    // CDS overlap is detected even without fasta (ret=true set before init)
     try std.testing.expect(hit);
 
-    // Check that a consequence was staged on the vrec
-    const vbuf = ctx.vcf_rbuf.front().?;
-    const vrec = &vbuf.vrecs.items[0];
-    try std.testing.expect(vrec.vcsqs.items.len > 0);
-    try std.testing.expect(vrec.vcsqs.items[0].csq_type & CSQ_CODING_SEQUENCE != 0);
+    // Without fasta, transcript aux cannot be initialized, so no consequence
+    // is staged. The CDS hit still prevents fallthrough to UTR/intron.
 }
 
 test "testUtr: variant in UTR5 region is detected" {
     const allocator = std.testing.allocator;
 
-    const gff = try makeTestGff(allocator);
-    defer destroyTestGff(allocator, gff);
+    const tgff = try makeTestGff(allocator);
+    defer destroyTestGff(allocator, tgff);
 
     var ctx = try CsqContext.init(allocator, .{
         .gff_fname = "test.gff",
         .phase = .drop_gt,
     });
     defer ctx.deinit();
-    ctx.gff = gff;
+    ctx.gff = tgff.gff;
 
     const alleles = [_][]const u8{ "A", "T" };
     // Position 150 is inside UTR5 [100, 199]
@@ -1391,15 +2236,15 @@ test "testUtr: variant in UTR5 region is detected" {
 test "testTscript: intronic variant in coding transcript gets INTRON" {
     const allocator = std.testing.allocator;
 
-    const gff = try makeTestGff(allocator);
-    defer destroyTestGff(allocator, gff);
+    const tgff = try makeTestGff(allocator);
+    defer destroyTestGff(allocator, tgff);
 
     var ctx = try CsqContext.init(allocator, .{
         .gff_fname = "test.gff",
         .phase = .drop_gt,
     });
     defer ctx.deinit();
-    ctx.gff = gff;
+    ctx.gff = tgff.gff;
 
     const alleles = [_][]const u8{ "A", "T" };
     // Position 500 is inside transcript [100, 900] but outside CDS [200, 400]
@@ -1489,15 +2334,15 @@ test "testTscript: variant in non-coding transcript gets NON_CODING" {
 test "testSplice: variant near exon boundary sets splice consequence" {
     const allocator = std.testing.allocator;
 
-    const gff = try makeTestGff(allocator);
-    defer destroyTestGff(allocator, gff);
+    const tgff = try makeTestGff(allocator);
+    defer destroyTestGff(allocator, tgff);
 
     var ctx = try CsqContext.init(allocator, .{
         .gff_fname = "test.gff",
         .phase = .drop_gt,
     });
     defer ctx.deinit();
-    ctx.gff = gff;
+    ctx.gff = tgff.gff;
 
     const alleles = [_][]const u8{ "A", "T" };
     // Position 399 is within the last 3bp of exon [200, 400], which triggers
@@ -1528,15 +2373,15 @@ test "testSplice: variant near exon boundary sets splice consequence" {
 test "testSplice: variant far from exon boundary has no splice consequence" {
     const allocator = std.testing.allocator;
 
-    const gff = try makeTestGff(allocator);
-    defer destroyTestGff(allocator, gff);
+    const tgff = try makeTestGff(allocator);
+    defer destroyTestGff(allocator, tgff);
 
     var ctx = try CsqContext.init(allocator, .{
         .gff_fname = "test.gff",
         .phase = .drop_gt,
     });
     defer ctx.deinit();
-    ctx.gff = gff;
+    ctx.gff = tgff.gff;
 
     const alleles = [_][]const u8{ "A", "T" };
     // Position 500 is well outside the exon [200, 400] and beyond the
@@ -1560,16 +2405,18 @@ test "testSplice: variant far from exon boundary has no splice consequence" {
 test "process: full cascade CDS -> UTR -> splice -> tscript" {
     const allocator = std.testing.allocator;
 
-    const gff = try makeTestGff(allocator);
-    defer destroyTestGff(allocator, gff);
+    const tgff = try makeTestGff(allocator);
+    defer destroyTestGff(allocator, tgff);
 
     var ctx = try CsqContext.init(allocator, .{
         .gff_fname = "test.gff",
         .phase = .drop_gt,
         .local_csq = true,
+        .force = true,
+        .verbosity = 0,
     });
     defer ctx.deinit();
-    ctx.gff = gff;
+    ctx.gff = tgff.gff;
 
     // Variant in CDS region
     const alleles_cds = [_][]const u8{ "A", "T" };
@@ -1600,4 +2447,253 @@ test "process: full cascade CDS -> UTR -> splice -> tscript" {
 
     // Verify that both records were processed (ring buffer is empty after flush)
     try std.testing.expectEqual(@as(usize, 0), ctx.vcf_rbuf.len);
+}
+
+/// Helper: create a test GFF with pre-populated reference sequences for
+/// CDS translation tests. The transcript spans chr1:[100,900], forward strand,
+/// with a single CDS at [200,400] (len=201). The reference sequence starts
+/// with ATG (Met) at position 200-202, followed by GAA (Glu) at 203-205, etc.
+fn makeTestGffWithRef(allocator: std.mem.Allocator) !TestGff {
+    const tgff = try makeTestGff(allocator);
+    const tr = tgff.tr;
+
+    // Build a mock reference sequence covering [tr.beg-10, tr.end+10] = [90, 910]
+    // ref_seq length = (tr.end - tr.beg + 1) + 2*N_REF_PAD = 801 + 20 = 821
+    const ref_len: usize = @as(usize, tr.end - tr.beg + 1) + 2 * N_REF_PAD;
+    const ref_seq = try allocator.alloc(u8, ref_len);
+    @memset(ref_seq, 'A'); // default all A
+
+    // Set up the CDS region: starts at ref_seq[N_REF_PAD + (cds.beg - tr.beg)]
+    // = ref_seq[10 + 100] = ref_seq[110]
+    // CDS positions [200, 400] => ref_seq[110..311]
+    //
+    // First codon (pos 200-202): ATG = Met (start codon)
+    ref_seq[110] = 'A';
+    ref_seq[111] = 'T';
+    ref_seq[112] = 'G';
+    // Second codon (pos 203-205): GAA = Glu
+    ref_seq[113] = 'G';
+    ref_seq[114] = 'A';
+    ref_seq[115] = 'A';
+    // Third codon (pos 206-208): TGC = Cys
+    ref_seq[116] = 'T';
+    ref_seq[117] = 'G';
+    ref_seq[118] = 'C';
+    // Fill rest of CDS with AAA (Lys) codons
+    var i: usize = 119;
+    while (i < 311) : (i += 3) {
+        ref_seq[i] = 'A';
+        if (i + 1 < 311) ref_seq[i + 1] = 'A';
+        if (i + 2 < 311) ref_seq[i + 2] = 'A';
+    }
+
+    // Build the spliced reference: N_REF_PAD + CDS + N_REF_PAD
+    const cds_len: usize = 201;
+    const sref_len: usize = 2 * N_REF_PAD + cds_len;
+    const sref = try allocator.alloc(u8, sref_len);
+    // Left padding: from ref_seq at cds_offset - N_REF_PAD = 100
+    @memcpy(sref[0..N_REF_PAD], ref_seq[100 .. 100 + N_REF_PAD]);
+    // CDS region
+    @memcpy(sref[N_REF_PAD .. N_REF_PAD + cds_len], ref_seq[110 .. 110 + cds_len]);
+    // Right padding: from ref_seq after CDS
+    @memcpy(sref[N_REF_PAD + cds_len .. sref_len], ref_seq[110 + cds_len .. 110 + cds_len + N_REF_PAD]);
+
+    // Create the Tscript (aux data) with the reference
+    const taux = try allocator.create(Tscript);
+    taux.* = .{
+        .ref_seq = ref_seq,
+        .sref = sref,
+        .nsref = @intCast(sref_len),
+    };
+
+    // Create haplotype tree root node (needed for testCds)
+    const root = try allocator.create(HapNode);
+    root.* = HapNode.init(.root);
+    root.nend = 1; // single haplotype for DROP_GT
+    taux.root = root;
+
+    tr.aux = taux;
+
+    return tgff;
+}
+
+fn destroyTestGffWithRef(allocator: std.mem.Allocator, tgff: TestGff) void {
+    // Clean up the ref_seq and sref we allocated
+    if (tgff.tr.aux) |aux_raw| {
+        const taux: *Tscript = @ptrCast(@alignCast(aux_raw));
+        if (taux.ref_seq) |rs| allocator.free(rs);
+        if (taux.sref) |sr| allocator.free(sr);
+        // Clean up any children created by hapInit
+        if (taux.root) |root| {
+            for (root.children.items) |child_node| {
+                if (child_node.payload == .cds) {
+                    if (child_node.payload.cds.seq) |seq| allocator.free(seq);
+                }
+                if (child_node.var_str) |vs| allocator.free(vs);
+                child_node.deinit(allocator);
+                allocator.destroy(child_node);
+            }
+            root.deinit(allocator);
+            allocator.destroy(root);
+        }
+        taux.hap.deinit(allocator);
+        allocator.destroy(taux);
+        tgff.tr.aux = null;
+    }
+    tgff.gff.deinit();
+    allocator.destroy(tgff.gff);
+}
+
+test "testCdsLocal with ref: missense consequence for T>A at second codon position" {
+    const allocator = std.testing.allocator;
+
+    const tgff = try makeTestGffWithRef(allocator);
+    defer destroyTestGffWithRef(allocator, tgff);
+
+    var ctx = try CsqContext.init(allocator, .{
+        .gff_fname = "test.gff",
+        .phase = .drop_gt,
+        .local_csq = true,
+        .force = true,
+        .verbosity = 0,
+    });
+    defer ctx.deinit();
+    ctx.gff = tgff.gff;
+
+    // Variant at position 201 (second base of first codon ATG):
+    // REF=T, ALT=A => codon changes ATG(Met) -> AAG(Lys) = missense
+    const alleles = [_][]const u8{ "T", "A" };
+    var rec = VcfRecord{
+        .pos = 201,
+        .rid = 0,
+        .n_allele = 2,
+        .alleles = &alleles,
+        .rlen = 1,
+        .chr = "chr1",
+    };
+
+    _ = try ctx.vbufPush(&rec);
+    const hit = try ctx.testCdsLocal(&rec);
+
+    try std.testing.expect(hit);
+
+    // Check that a consequence was staged
+    const vbuf = ctx.vcf_rbuf.front().?;
+    const vrec = &vbuf.vrecs.items[0];
+    try std.testing.expect(vrec.vcsqs.items.len > 0);
+
+    // The consequence should contain missense_variant (bit 2)
+    const csq_type = vrec.vcsqs.items[0].csq_type;
+    try std.testing.expect(csq_type & CSQ_MISSENSE_VARIANT != 0);
+}
+
+test "testCds DROP_GT: haplotype tree node created for CDS variant" {
+    const allocator = std.testing.allocator;
+
+    const tgff = try makeTestGffWithRef(allocator);
+    defer destroyTestGffWithRef(allocator, tgff);
+
+    var ctx = try CsqContext.init(allocator, .{
+        .gff_fname = "test.gff",
+        .phase = .drop_gt,
+        .force = true,
+        .verbosity = 0,
+    });
+    defer ctx.deinit();
+    ctx.gff = tgff.gff;
+
+    // Variant at position 204 (second base of second codon GAA):
+    // REF=A, ALT=T => codon changes GAA(Glu) -> GTA(Val) = missense
+    const alleles = [_][]const u8{ "A", "T" };
+    var rec = VcfRecord{
+        .pos = 204,
+        .rid = 0,
+        .n_allele = 2,
+        .alleles = &alleles,
+        .rlen = 1,
+        .chr = "chr1",
+    };
+
+    const vbuf = try ctx.vbufPush(&rec);
+    const hit = try ctx.testCds(&rec, vbuf);
+
+    try std.testing.expect(hit);
+    try std.testing.expectEqual(@as(u32, 900), vbuf.keep_until);
+
+    // The transcript should have aux data with a haplotype tree
+    const taux: *Tscript = @ptrCast(@alignCast(tgff.tr.aux orelse unreachable));
+    try std.testing.expect(taux.root != null);
+
+    // The root should have a child (the variant node)
+    const root = taux.root.?;
+    try std.testing.expect(root.children.items.len > 0);
+
+    // The child should be a CDS node with the variant applied
+    const child = root.children.items[0];
+    try std.testing.expect(child.payload == .cds);
+    try std.testing.expectEqual(@as(u32, 204), child.rbeg);
+
+    // The haplotype leaf should point to the child
+    try std.testing.expect(taux.hap.items.len > 0);
+    try std.testing.expectEqual(child, taux.hap.items[0]);
+    try std.testing.expectEqual(@as(u32, 1), child.nend);
+}
+
+// ---------------------------------------------------------------------------
+// injectBcsq tests
+// ---------------------------------------------------------------------------
+
+test "injectBcsq: replace dot INFO with BCSQ" {
+    const allocator = std.testing.allocator;
+    const line = "chr1\t100\t.\tA\tT\t.\tPASS\t.\tGT\t0/1";
+    const result = try injectBcsq(allocator, line, "missense|GENE|TR|protein_coding|+", "BCSQ");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "chr1\t100\t.\tA\tT\t.\tPASS\tBCSQ=missense|GENE|TR|protein_coding|+\tGT\t0/1",
+        result,
+    );
+}
+
+test "injectBcsq: append to existing INFO" {
+    const allocator = std.testing.allocator;
+    const line = "chr1\t100\t.\tA\tT\t.\tPASS\tDP=30;AF=0.5\tGT\t0/1";
+    const result = try injectBcsq(allocator, line, "intron|G||lncRNA", "BCSQ");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "chr1\t100\t.\tA\tT\t.\tPASS\tDP=30;AF=0.5;BCSQ=intron|G||lncRNA\tGT\t0/1",
+        result,
+    );
+}
+
+test "injectBcsq: custom tag name" {
+    const allocator = std.testing.allocator;
+    const line = "chr1\t100\t.\tA\tT\t.\tPASS\t.";
+    const result = try injectBcsq(allocator, line, "synonymous|X||", "MY_CSQ");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "chr1\t100\t.\tA\tT\t.\tPASS\tMY_CSQ=synonymous|X||",
+        result,
+    );
+}
+
+test "injectBcsq: line with trailing newline" {
+    const allocator = std.testing.allocator;
+    const line = "chr1\t100\t.\tA\tT\t.\tPASS\t.\n";
+    const result = try injectBcsq(allocator, line, "stop_gained|G|T|pc", "BCSQ");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "chr1\t100\t.\tA\tT\t.\tPASS\tBCSQ=stop_gained|G|T|pc",
+        result,
+    );
+}
+
+test "injectBcsq: minimal line without FORMAT/samples" {
+    const allocator = std.testing.allocator;
+    const line = "chr1\t100\t.\tA\tT\t.\tPASS\t.";
+    const result = try injectBcsq(allocator, line, "missense|G||pc|+", "BCSQ");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "chr1\t100\t.\tA\tT\t.\tPASS\tBCSQ=missense|G||pc|+",
+        result,
+    );
 }
