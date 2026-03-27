@@ -670,6 +670,232 @@ fn benchUppercase() void {
 }
 
 // ---------------------------------------------------------------------------
+// 11. Parallel hapFinalize Thread Pool
+// ---------------------------------------------------------------------------
+
+fn benchParallelHapFinalize(allocator: std.mem.Allocator) !void {
+    print("\n[11] Parallel hapFinalize (thread pool dispatch)\n", .{});
+
+    const code = translate.findGeneticCode(1) orelse {
+        print("  ERROR: genetic code table 1 not found\n", .{});
+        return;
+    };
+
+    // Build synthetic transcripts with haplotype trees.
+    // Each transcript has a root node with several CDS child nodes ending in
+    // leaf nodes (nend > 0). hapFinalize traverses the tree, splices the ref,
+    // translates codons, and determines consequences -- this is the expensive
+    // per-transcript work we want to parallelize.
+    const gff_t = lib.gff_types;
+    const csq_t = lib.csq_types;
+    const n_transcripts: usize = 200;
+    const cds_per_transcript: usize = 5;
+    const cds_len: u32 = 300; // 100 codons per CDS
+    const n_ref_pad: u32 = @intCast(csq_t.n_ref_pad);
+
+    // Pre-build transcript and tree structures
+    var transcripts: [n_transcripts]*gff_t.Transcript = undefined;
+    var tscripts: [n_transcripts]*csq_t.Tscript = undefined;
+    var genes: [n_transcripts]gff_t.Gene = undefined;
+    var cds_entries: [n_transcripts][cds_per_transcript]*gff_t.CdsEntry = undefined;
+
+    // RNG for sequence generation
+    var rng = makeRng();
+    const bases = "ACGT";
+
+    for (0..n_transcripts) |ti| {
+        // Gene
+        genes[ti] = .{
+            .name = null,
+            .iseq = 0,
+            .id = @intCast(ti),
+            .beg = 0,
+            .end = cds_per_transcript * (cds_len + 200) + 2 * n_ref_pad,
+            .strand = .forward,
+            .used = true,
+        };
+
+        // Transcript
+        const tr = try allocator.create(gff_t.Transcript);
+        tr.* = gff_t.Transcript.init(allocator);
+        tr.id = @intCast(ti);
+        tr.beg = 0;
+        tr.end = genes[ti].end;
+        tr.strand = .forward;
+        tr.biotype = .protein_coding;
+        tr.gene = &genes[ti];
+        transcripts[ti] = tr;
+
+        // CDS entries
+        var cds_offset: u32 = 0;
+        for (0..cds_per_transcript) |ci| {
+            const entry = try allocator.create(gff_t.CdsEntry);
+            entry.* = .{
+                .tr = tr,
+                .beg = cds_offset,
+                .pos = cds_offset,
+                .len = cds_len,
+                .icds = @intCast(ci),
+                .phase = .phase0,
+            };
+            try tr.cds.append(allocator, entry);
+            cds_entries[ti][ci] = entry;
+            cds_offset += cds_len + 200; // gap between CDS
+        }
+
+        // Tscript auxiliary data
+        const tscript = try allocator.create(csq_t.Tscript);
+        tscript.* = .{};
+        tscripts[ti] = tscript;
+        tr.aux = tscript;
+
+        // Build ref_seq (entire transcript region with padding)
+        const ref_len = tr.end + 2 * n_ref_pad;
+        const ref_seq = try allocator.alloc(u8, ref_len);
+        // Start codon ATG at first CDS
+        for (ref_seq) |*b| b.* = bases[rng.random().uintLessThan(usize, 4)];
+        // Ensure start codon
+        if (n_ref_pad + 0 < ref_seq.len) ref_seq[n_ref_pad] = 'A';
+        if (n_ref_pad + 1 < ref_seq.len) ref_seq[n_ref_pad + 1] = 'T';
+        if (n_ref_pad + 2 < ref_seq.len) ref_seq[n_ref_pad + 2] = 'G';
+        tscript.ref_seq = ref_seq;
+
+        // Build haplotype tree: root -> CDS children -> leaf
+        const root = try allocator.create(csq_t.HapNode);
+        root.* = csq_t.HapNode.init(.root);
+        tscript.root = root;
+
+        // Create a chain: root has one CDS child per exon, last is a leaf
+        var parent = root;
+        for (0..cds_per_transcript) |ci| {
+            const child = try allocator.create(csq_t.HapNode);
+            // Build a CDS node with a single substitution
+            const seq = try allocator.alloc(u8, cds_len);
+            for (seq) |*b| b.* = bases[rng.random().uintLessThan(usize, 4)];
+            // ATG at start
+            if (ci == 0) {
+                seq[0] = 'A';
+                seq[1] = 'T';
+                seq[2] = 'G';
+            }
+            child.* = csq_t.HapNode.init(.cds);
+            child.payload = .{ .cds = .{ .seq = seq } };
+            child.sbeg = @intCast(ci * cds_len);
+            child.icds = @intCast(ci);
+            child.dlen = 0;
+            child.rlen = 1;
+            child.rbeg = @intCast(ci * (cds_len + 200) + 50);
+            child.rec_pos = child.rbeg;
+
+            // Last child is a leaf
+            if (ci == cds_per_transcript - 1) {
+                child.nend = 1;
+            }
+
+            try parent.children.append(allocator, child);
+            parent = child;
+        }
+    }
+
+    defer {
+        for (0..n_transcripts) |ti| {
+            // Free tree nodes
+            const tscript = tscripts[ti];
+            if (tscript.root) |root| {
+                var stack: [32]*csq_t.HapNode = undefined;
+                var sp: usize = 0;
+                stack[sp] = root;
+                sp += 1;
+                while (sp > 0) {
+                    sp -= 1;
+                    const node = stack[sp];
+                    for (node.children.items) |ch| {
+                        if (sp < stack.len) {
+                            stack[sp] = ch;
+                            sp += 1;
+                        }
+                    }
+                    if (node.payload == .cds) {
+                        if (node.payload.cds.seq) |s| allocator.free(s);
+                    }
+                    node.deinit(allocator);
+                    allocator.destroy(node);
+                }
+            }
+            if (tscript.sref) |s| allocator.free(s);
+            if (tscript.ref_seq) |r| allocator.free(r);
+            tscript.deinit(allocator);
+            allocator.destroy(tscript);
+            for (cds_entries[ti][0..cds_per_transcript]) |entry| allocator.destroy(entry);
+            transcripts[ti].cds.deinit(allocator);
+            allocator.destroy(transcripts[ti]);
+        }
+    }
+
+    // ---- Benchmark sequential hapFinalize ----
+    const iterations: usize = 50;
+
+    const start_seq = nanoTimestamp();
+    for (0..iterations) |_| {
+        // Reset sref so hapFinalize rebuilds it each time
+        for (0..n_transcripts) |ti| {
+            if (tscripts[ti].sref) |s| allocator.free(s);
+            tscripts[ti].sref = null;
+            tscripts[ti].nsref = 0;
+        }
+        for (0..n_transcripts) |ti| {
+            var ctx = haplotype.HapContext.init(allocator, code);
+            defer ctx.deinit();
+            ctx.tr = transcripts[ti];
+            haplotype.hapFinalize(&ctx) catch {};
+        }
+    }
+    const end_seq = nanoTimestamp();
+    const ms_seq = elapsed_ms(start_seq, end_seq);
+    printResult("sequential hapFinalize", n_transcripts * iterations, ms_seq);
+
+    // ---- Benchmark parallel hapFinalize using std.Thread.Pool ----
+    const thread_counts = [_]u32{ 2, 4, 8 };
+    for (thread_counts) |n_threads| {
+        var pool: std.Thread.Pool = undefined;
+        pool.init(.{
+            .allocator = allocator,
+            .n_jobs = n_threads,
+        }) catch {
+            print("  {d} threads: failed to create pool\n", .{n_threads});
+            continue;
+        };
+        defer pool.deinit();
+
+        const start_par = nanoTimestamp();
+        for (0..iterations) |_| {
+            for (0..n_transcripts) |ti| {
+                if (tscripts[ti].sref) |s| allocator.free(s);
+                tscripts[ti].sref = null;
+                tscripts[ti].nsref = 0;
+            }
+
+            var wg = std.Thread.WaitGroup{};
+            for (0..n_transcripts) |ti| {
+                pool.spawnWg(&wg, struct {
+                    fn work(alloc: std.mem.Allocator, gc: *const translate.GeneticCode, tr: *gff_t.Transcript) void {
+                        var ctx = haplotype.HapContext.init(alloc, gc);
+                        defer ctx.deinit();
+                        ctx.tr = tr;
+                        haplotype.hapFinalize(&ctx) catch {};
+                    }
+                }.work, .{ allocator, code, transcripts[ti] });
+            }
+            wg.wait();
+        }
+        const end_par = nanoTimestamp();
+        const ms_par = elapsed_ms(start_par, end_par);
+        const speedup = ms_seq / ms_par;
+        print("  {d} threads: {d:.1} ms  ({d:.2}x speedup)\n", .{ n_threads, ms_par, speedup });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -691,6 +917,7 @@ pub fn main() !void {
     benchBatchTranslate();
     benchProteinComparison();
     benchUppercase();
+    try benchParallelHapFinalize(allocator);
 
     print("\nDone.\n", .{});
 }

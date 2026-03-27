@@ -8,6 +8,7 @@ const VcfRecord = lib.vcf_record.VcfRecord;
 const CsqContext = csq_mod.CsqContext;
 const GffParser = gff_mod.GffParser;
 const Phase = csq_mod.Phase;
+const Filter = lib.filter.Filter;
 
 /// Adapter function: bridges CsqContext.FetchSeqFn to HtsFaidx.fetchSeq
 fn htsFaidxFetchAdapter(ctx: *anyopaque, allocator: std.mem.Allocator, chr: [*:0]const u8, beg: i64, end: i64) ?[]u8 {
@@ -80,7 +81,10 @@ const CsqOptions = struct {
     ncsq: u32 = 15,
     custom_tag: []const u8 = "BCSQ",
     brief_predictions: u32 = 0,
+    n_threads: u32 = 1,
     show_help: bool = false,
+    include_expr: ?[]const u8 = null,
+    exclude_expr: ?[]const u8 = null,
 };
 
 const CsqArgError = error{
@@ -89,6 +93,7 @@ const CsqArgError = error{
     InvalidNcsq,
     InvalidOutputType,
     InvalidBriefPredictions,
+    InvalidThreadCount,
     UnknownOption,
 };
 
@@ -130,14 +135,21 @@ fn parseCsqArgs(args_iter: *std.process.ArgIterator) CsqArgError!CsqOptions {
         } else if (std.mem.eql(u8, arg, "-B") or std.mem.eql(u8, arg, "--trim-protein-seq")) {
             const val = args_iter.next() orelse return error.MissingArgValue;
             opts.brief_predictions = std.fmt.parseInt(u32, val, 10) catch return error.InvalidBriefPredictions;
+        } else if (std.mem.eql(u8, arg, "-i") or std.mem.eql(u8, arg, "--include")) {
+            opts.include_expr = args_iter.next() orelse return error.MissingArgValue;
+        } else if (std.mem.eql(u8, arg, "-e") or std.mem.eql(u8, arg, "--exclude")) {
+            opts.exclude_expr = args_iter.next() orelse return error.MissingArgValue;
+        } else if (std.mem.eql(u8, arg, "--threads")) {
+            const val = args_iter.next() orelse return error.MissingArgValue;
+            opts.n_threads = std.fmt.parseInt(u32, val, 10) catch return error.InvalidThreadCount;
         } else if (std.mem.eql(u8, arg, "--force")) {
             opts.force = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             opts.show_help = true;
         } else if (arg.len > 0 and arg[0] == '-') {
             // Skip unknown options that take a value (consume next arg to avoid
-            // treating it as a positional).  Single-dash flags like -e, -i, -r,
-            // -R, -s, -S, -t, -T and long options like --threads, --write-index
+            // treating it as a positional).  Single-dash flags like -r,
+            // -R, -s, -S, -t, -T and long options like --write-index
             // are not yet implemented but should not cause a hard error.
             _ = args_iter.next();
         } else {
@@ -514,6 +526,7 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
             error.InvalidNcsq => "Error: expected positive integer with --ncsq\n",
             error.InvalidOutputType => "Error: invalid output type, expected one of: v, z, b, u\n",
             error.InvalidBriefPredictions => "Error: expected non-negative integer with --trim-protein-seq\n",
+            error.InvalidThreadCount => "Error: expected non-negative integer with --threads\n",
             error.UnknownOption => "Error: unknown option\n",
         };
         stderr_file.writeAll(msg) catch {};
@@ -716,6 +729,7 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
         .bcsq_tag = opts.custom_tag,
         .ncsq2_max = opts.ncsq * 2,
         .brief_predictions = opts.brief_predictions,
+        .n_threads = opts.n_threads,
         .n_samples = n_samples,
         .fai_ptr = @ptrCast(&fai),
         .fetch_seq_fn = &htsFaidxFetchAdapter,
@@ -724,6 +738,21 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
         std.process.exit(1);
     };
     defer csq_ctx.deinit();
+
+    // ---- Initialize filter (if -i or -e was given) ----
+    var site_filter: ?Filter = null;
+    if (opts.include_expr) |expr| {
+        site_filter = Filter.init(allocator, expr, false) catch {
+            stderr_file.writeAll("Error: failed to parse include expression\n") catch {};
+            std.process.exit(1);
+        };
+    } else if (opts.exclude_expr) |expr| {
+        site_filter = Filter.init(allocator, expr, true) catch {
+            stderr_file.writeAll("Error: failed to parse exclude expression\n") catch {};
+            std.process.exit(1);
+        };
+    }
+    defer if (site_filter) |*f| f.deinit();
 
     // ---- Main processing loop ----
     var rec = VcfRecord.init(allocator);
@@ -756,6 +785,11 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
         if (!has_record) break;
 
         n_records += 1;
+
+        // Apply site filter (-i/-e) before processing
+        if (site_filter) |*sf| {
+            if (!sf.eval(&rec)) continue;
+        }
 
         // Save the original line for later BCSQ injection.
         // We must dupe it because rec._storage is reused on the next read.

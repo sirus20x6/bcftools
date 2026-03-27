@@ -503,6 +503,9 @@ pub const Options = struct {
     /// Opaque pointer to a bcf_hdr_t.  Used by the C API bridge
     /// (bcftools_csq_process) to resolve rid -> chromosome name.
     hdr_ptr: ?*anyopaque = null,
+    /// Number of worker threads for parallel haplotype finalization.
+    /// 0 = auto-detect (use all available cores), 1 = single-threaded (no pool).
+    n_threads: u32 = 1,
 };
 
 // ---------------------------------------------------------------------------
@@ -518,6 +521,10 @@ pub const CsqContext = struct {
 
     // Haplotype processing
     hap_ctx: HapContext,
+
+    // Thread pool for parallel hapFinalize
+    thread_pool: ?std.Thread.Pool,
+    n_threads: u32,
 
     // FASTA reference access
     fasta_fname: []const u8,
@@ -606,11 +613,31 @@ pub const CsqContext = struct {
         // Set module-level GFF pointer for format callbacks
         g_gff_ptr = gff_ptr;
 
+        // Resolve effective thread count: 0 = auto-detect, 1 = single-threaded
+        const effective_threads: u32 = if (options.n_threads == 0)
+            @max(1, @as(u32, @intCast(std.Thread.getCpuCount() catch 1)))
+        else
+            options.n_threads;
+
+        // Initialize thread pool when using more than one thread
+        var pool: ?std.Thread.Pool = null;
+        if (effective_threads > 1) {
+            var p: std.Thread.Pool = undefined;
+            try p.init(.{
+                .allocator = allocator,
+                .n_jobs = effective_threads,
+            });
+            pool = p;
+        }
+        errdefer if (pool) |*p| p.deinit();
+
         return CsqContext{
             .allocator = allocator,
             .gff = gff_ptr,
             .owns_gff = owns_gff,
             .hap_ctx = HapContext.init(allocator, gencode),
+            .thread_pool = pool,
+            .n_threads = effective_threads,
             .fasta_fname = options.fasta_fname,
             .fai_ptr = options.fai_ptr,
             .fetch_seq_fn = options.fetch_seq_fn,
@@ -664,6 +691,8 @@ pub const CsqContext = struct {
         if (self.gt_cache) |gc| self.allocator.free(gc);
         self.gt_cache = null;
         self.gt_cache_rec = null;
+        // Clean up thread pool
+        if (self.thread_pool) |*pool| pool.deinit();
         // Clean up haplotype context
         self.hap_ctx.deinit();
         // Clean up any remaining transcripts in the removal list
@@ -1183,44 +1212,78 @@ pub const CsqContext = struct {
     /// Pops transcripts from the active heap whose end <= pos, finalizes
     /// their haplotype trees, stages per-sample VCF consequences, and
     /// defers transcript cleanup until after vbufFlush.
+    ///
+    /// When multiple threads are configured, hapFinalize runs in parallel
+    /// across transcripts (each has its own independent haplotype tree).
+    /// The subsequent transferTreeCsqToVbuf and hapStageVcf steps run
+    /// sequentially because they modify the shared vbuf.
     pub fn hapFlush(self: *CsqContext, pos: u32) !void {
+        // ── Phase 1: collect all transcripts that need flushing ──
+        var batch: std.ArrayList(*Transcript) = .empty;
+        defer batch.deinit(self.allocator);
+        // Track which transcripts have a non-empty tree (need finalize + transfer)
+        var has_tree: std.ArrayList(bool) = .empty;
+        defer has_tree.deinit(self.allocator);
+
         while (self.active_transcripts.count() > 0) {
             const tr = self.active_transcripts.peek().?;
             if (tr.end > pos) break;
-
-            // Pop the transcript with the smallest end position
             _ = self.active_transcripts.remove();
-
-            // Point the haplotype context at this transcript
-            self.hap_ctx.tr = tr;
+            try batch.append(self.allocator, tr);
 
             const taux: *Tscript = self.getTscript(tr) orelse {
-                // No aux data -- nothing to finalize, just mark for removal
-                try self.rm_transcripts.append(self.allocator, tr);
+                try has_tree.append(self.allocator, false);
                 continue;
             };
-
             const root = taux.root orelse {
-                try self.rm_transcripts.append(self.allocator, tr);
+                try has_tree.append(self.allocator, false);
                 continue;
             };
+            try has_tree.append(self.allocator, root.children.items.len > 0);
+        }
 
-            if (root.children.items.len > 0) {
-                // Finalize the haplotype tree: DFS traversal, translation,
-                // consequence determination for each leaf path
-                haplotype_mod.hapFinalize(&self.hap_ctx) catch |err| {
-                    std.log.warn("hapFinalize failed for transcript {d}: {}", .{ tr.id, err });
+        if (batch.items.len == 0) return;
+
+        // ── Phase 2: finalize haplotype trees (parallelizable) ──
+        // Count how many transcripts actually need finalization
+        var finalize_count: usize = 0;
+        for (has_tree.items) |ht| {
+            if (ht) finalize_count += 1;
+        }
+
+        if (finalize_count > 0) {
+            if (self.n_threads > 1 and finalize_count > 1 and self.thread_pool != null) {
+                // Parallel finalization: each transcript gets its own HapContext
+                // since HapContext contains thread-local scratch buffers.
+                try self.hapFinalizeParallel(batch.items, has_tree.items);
+            } else {
+                // Sequential finalization (single-threaded path)
+                for (batch.items, has_tree.items) |tr, ht| {
+                    if (!ht) continue;
+                    self.hap_ctx.tr = tr;
+                    haplotype_mod.hapFinalize(&self.hap_ctx) catch |err| {
+                        std.log.warn("hapFinalize failed for transcript {d}: {}", .{ tr.id, err });
+                    };
+                }
+            }
+        }
+
+        // ── Phase 3: transfer consequences & stage VCF (sequential, shared state) ──
+        for (batch.items, has_tree.items) |tr, ht| {
+            if (ht) {
+                const taux: *Tscript = self.getTscript(tr) orelse {
+                    try self.rm_transcripts.append(self.allocator, tr);
+                    continue;
+                };
+                const root = taux.root orelse {
+                    try self.rm_transcripts.append(self.allocator, tr);
+                    continue;
                 };
 
-                // Transfer consequences from haplotype tree leaf nodes into vbuf vrecs.
-                // hapFinalize populates csq_list on leaf nodes (types.Csq), but the
-                // pipeline vbuf uses format.Vcsq. We walk the tree and push each
-                // consequence into the matching vrec by position.
                 self.transferTreeCsqToVbuf(root, tr) catch |err| {
                     std.log.warn("transferTreeCsqToVbuf failed for transcript {d}: {}", .{ tr.id, err });
                 };
 
-                // Stage per-sample VCF consequences (unless DROP_GT mode)
                 if (self.phase != .drop_gt) {
                     const n_smpl = self.n_samples;
                     var i: u32 = 0;
@@ -1230,7 +1293,6 @@ pub const CsqContext = struct {
                         else
                             @intCast(i);
 
-                        // Two haplotypes per sample
                         if (taux.hap.items.len > i * 2) {
                             self.hapStageVcf(ismpl, 0, taux.hap.items[i * 2]);
                         }
@@ -1241,10 +1303,44 @@ pub const CsqContext = struct {
                 }
             }
 
-            // Mark transcript for deferred cleanup (cannot delete now because
-            // vbuf_flush still needs the transcript data for by-position output)
             try self.rm_transcripts.append(self.allocator, tr);
         }
+    }
+
+    /// Run hapFinalize in parallel across transcripts using the thread pool.
+    /// Each worker thread gets its own HapContext with independent scratch buffers.
+    fn hapFinalizeParallel(
+        self: *CsqContext,
+        transcripts: []*Transcript,
+        has_tree: []const bool,
+    ) !void {
+        var pool = &(self.thread_pool orelse return);
+        const gencode = self.hap_ctx.gencode;
+        const allocator = self.allocator;
+
+        var wg = std.Thread.WaitGroup{};
+
+        for (transcripts, has_tree) |tr, ht| {
+            if (!ht) continue;
+            pool.spawnWg(&wg, finalizeOneTranscript, .{ allocator, gencode, tr });
+        }
+
+        wg.wait();
+    }
+
+    /// Worker function for parallel hapFinalize. Creates a thread-local HapContext,
+    /// finalizes the transcript, then cleans up the context.
+    fn finalizeOneTranscript(
+        allocator: std.mem.Allocator,
+        gencode: *const translate.GeneticCode,
+        tr: *Transcript,
+    ) void {
+        var ctx = HapContext.init(allocator, gencode);
+        defer ctx.deinit();
+        ctx.tr = tr;
+        haplotype_mod.hapFinalize(&ctx) catch |err| {
+            std.log.warn("hapFinalize (parallel) failed for transcript {d}: {}", .{ tr.id, err });
+        };
     }
 
     /// Walk the haplotype tree (DFS) and transfer consequences from leaf nodes
@@ -4227,4 +4323,41 @@ test "uppercaseInPlace: long sequence spanning multiple SIMD chunks" {
     for (buf, 0..) |c, i| {
         try std.testing.expectEqual(@as(u8, @intCast('A' + @as(u8, @intCast(i % 26)))), c);
     }
+}
+
+test "CsqContext init with n_threads=1 has no thread pool" {
+    const allocator = std.testing.allocator;
+    var ctx = try CsqContext.init(allocator, .{ .n_threads = 1 });
+    defer ctx.deinit();
+    try std.testing.expect(ctx.thread_pool == null);
+    try std.testing.expectEqual(@as(u32, 1), ctx.n_threads);
+}
+
+test "CsqContext init with n_threads=2 creates thread pool" {
+    const allocator = std.testing.allocator;
+    var ctx = try CsqContext.init(allocator, .{ .n_threads = 2 });
+    defer ctx.deinit();
+    try std.testing.expect(ctx.thread_pool != null);
+    try std.testing.expectEqual(@as(u32, 2), ctx.n_threads);
+}
+
+test "CsqContext init with n_threads=0 auto-detects" {
+    const allocator = std.testing.allocator;
+    var ctx = try CsqContext.init(allocator, .{ .n_threads = 0 });
+    defer ctx.deinit();
+    // Auto-detect should give at least 1 thread
+    try std.testing.expect(ctx.n_threads >= 1);
+    // If more than 1, should have a pool
+    if (ctx.n_threads > 1) {
+        try std.testing.expect(ctx.thread_pool != null);
+    }
+}
+
+test "hapFlush with empty active_transcripts is a no-op" {
+    const allocator = std.testing.allocator;
+    var ctx = try CsqContext.init(allocator, .{ .n_threads = 2 });
+    defer ctx.deinit();
+    // Flushing with no active transcripts should not crash
+    try ctx.hapFlush(1000);
+    try std.testing.expectEqual(@as(usize, 0), ctx.rm_transcripts.items.len);
 }
