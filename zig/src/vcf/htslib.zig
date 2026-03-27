@@ -13,7 +13,7 @@ pub const HtsHeader = struct {
     raw: *c.bcf_hdr_t,
 
     pub fn nSamples(self: *const HtsHeader) u32 {
-        return @intCast(c.bcf_hdr_nsamples(self.raw));
+        return @intCast(c.bcf_compat_nsamples(self.raw));
     }
 
     pub fn seqName(self: *const HtsHeader, rid: i32) []const u8 {
@@ -71,13 +71,13 @@ pub const HtsVcfReader = struct {
         }
         return .{
             .sr = sr,
-            .hdr = .{ .raw = sr.readers[0].header },
+            .hdr = .{ .raw = c.bcf_compat_sr_header(sr, 0) },
         };
     }
 
     pub fn next(self: *HtsVcfReader) ?HtsRecord {
-        if (c.bcf_sr_next_line(self.sr) == 0) return null;
-        const rec = c.bcf_sr_get_line(self.sr, 0);
+        if (c.bcf_compat_sr_next_line(self.sr) == 0) return null;
+        const rec = c.bcf_compat_sr_get_line(self.sr, 0);
         if (rec == null) return null;
         return .{ .raw = rec.? };
     }
@@ -152,19 +152,19 @@ pub const HtsFaidx = struct {
 pub const BcfUpdateError = error{HtsUpdateFailed};
 
 pub fn bcfUpdateInfoString(hdr: *c.bcf_hdr_t, rec: *c.bcf1_t, tag: [*:0]const u8, val: [*:0]const u8) !void {
-    if (c.bcf_update_info_string(hdr, rec, tag, val) != 0)
+    if (c.bcf_compat_update_info_string(hdr, rec, tag, val) != 0)
         return error.HtsUpdateFailed;
 }
 
 pub fn bcfUpdateFormatInt32(hdr: *c.bcf_hdr_t, rec: *c.bcf1_t, tag: [*:0]const u8, vals: []const i32) !void {
-    if (c.bcf_update_format_int32(hdr, rec, tag, vals.ptr, @intCast(vals.len)) != 0)
+    if (c.bcf_compat_update_format_int32(hdr, rec, tag, vals.ptr, @intCast(vals.len)) != 0)
         return error.HtsUpdateFailed;
 }
 
 pub fn bcfGetGenotypes(hdr: *c.bcf_hdr_t, rec: *c.bcf1_t, alloc: std.mem.Allocator) ![]i32 {
     var gt: [*c]i32 = null;
     var ngt: c_int = 0;
-    const ret = c.bcf_get_genotypes(hdr, rec, @ptrCast(&gt), &ngt);
+    const ret = c.bcf_compat_get_genotypes(hdr, rec, @ptrCast(&gt), &ngt);
     if (ret <= 0) return error.HtsUpdateFailed;
     defer std.c.free(gt);
     const slice = gt[0..@intCast(ret)];

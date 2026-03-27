@@ -193,6 +193,26 @@ fn buildCsqRecord(rec: *const VcfRecord) csq_mod.VcfRecord {
     };
 }
 
+/// Build a pipeline VcfRecord directly from an htslib HtsRecord (bcf1_t),
+/// avoiding text serialization. The raw bcf1_t pointer is stored for
+/// in-place BCSQ injection on output.
+fn buildCsqRecordFromHts(hts_rec: *const htslib.HtsRecord, hdr: *const htslib.HtsHeader) csq_mod.VcfRecord {
+    const n: u32 = hts_rec.nAllele();
+    const count = @min(n, allele_scratch.len);
+    for (0..count) |i| {
+        allele_scratch[i] = hts_rec.allele(i);
+    }
+    return .{
+        .pos = hts_rec.pos(),
+        .rid = hts_rec.rid(),
+        .n_allele = count,
+        .alleles = allele_scratch[0..count],
+        .rlen = hts_rec.rlen(),
+        .chr = hts_rec.seqname(hdr),
+        .raw_bcf = @ptrCast(@constCast(hts_rec.raw)),
+    };
+}
+
 // -------------------------------------------------------------------------
 // Write a VCF record line, appending BCSQ to INFO if consequences exist
 // -------------------------------------------------------------------------
@@ -519,6 +539,57 @@ fn posKey(rid: i32, pos: u32) u64 {
     return (@as(u64, @bitCast(@as(i64, rid))) << 32) | @as(u64, pos);
 }
 
+/// Drain flushed records and write them directly via htslib using the raw bcf1_t
+/// pointer stored in each FlushedRecord. This avoids the text VCF serialization
+/// roundtrip entirely: BCSQ is injected into the bcf1_t INFO field and the
+/// record is written via bcf_write/vcf_write.
+fn writeFlushedRecordsDirect(
+    allocator: std.mem.Allocator,
+    writer: *htslib.HtsVcfWriter,
+    out_hdr: *htslib.c.bcf_hdr_t,
+    csq_ctx: *CsqContext,
+    bcsq_tag_z: [*:0]const u8,
+    n_samples: u32,
+) !void {
+    for (csq_ctx.flushed_records.items) |fr| {
+        if (fr.raw_bcf) |raw_ptr| {
+            const bcf_rec: *htslib.c.bcf1_t = @ptrCast(@alignCast(raw_ptr));
+
+            // Inject BCSQ INFO string directly into the bcf1_t
+            if (fr.bcsq_value) |bv| {
+                const bv_z = try allocator.dupeZ(u8, bv);
+                defer allocator.free(bv_z);
+                htslib.bcfUpdateInfoString(out_hdr, bcf_rec, bcsq_tag_z, bv_z) catch {};
+            }
+
+            // Inject FORMAT/BCSQ bitmask if present
+            if (fr.fmt_bm) |bm| {
+                if (n_samples > 0 and fr.nfmt > 0) {
+                    // Convert u32 bitmask to i32 for bcf_update_format_int32
+                    const nfmt_bcsq: usize = @max(1, fr.nfmt);
+                    const total = @as(usize, n_samples) * nfmt_bcsq;
+                    const i32_vals = try allocator.alloc(i32, total);
+                    defer allocator.free(i32_vals);
+                    for (0..total) |idx| {
+                        const val: u32 = if (idx < bm.len) bm[idx] else 0;
+                        i32_vals[idx] = @bitCast(val);
+                    }
+                    htslib.bcfUpdateFormatInt32(out_hdr, bcf_rec, bcsq_tag_z, i32_vals) catch {};
+                }
+            }
+
+            try writer.writeRecord(bcf_rec);
+
+            // Destroy the dup'd bcf1_t
+            htslib.c.bcf_compat_destroy(bcf_rec);
+        }
+
+        if (fr.bcsq_value) |bv| allocator.free(bv);
+        if (fr.fmt_bm) |bm| allocator.free(bm);
+    }
+    csq_ctx.flushed_records.clearRetainingCapacity();
+}
+
 // -------------------------------------------------------------------------
 // CSQ subcommand entry point
 // -------------------------------------------------------------------------
@@ -561,145 +632,99 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
 
     const allocator = std.heap.page_allocator;
 
-    // ---- Open VCF input ----
-    var reader = VcfReader.open(allocator, opts.input_fname.?) catch |err| {
-        std.debug.print("Error: failed to open VCF file '{s}': {}\n", .{ opts.input_fname.?, err });
+    // ---- Open VCF input via htslib synced reader (efficient BCF/VCF.gz support) ----
+    var input_fname_buf: [4096]u8 = undefined;
+    const input_fname_z: [*:0]const u8 = blk: {
+        const fname = opts.input_fname.?;
+        if (fname.len >= input_fname_buf.len) {
+            stderr_file.writeAll("Error: input path too long\n") catch {};
+            std.process.exit(1);
+        }
+        @memcpy(input_fname_buf[0..fname.len], fname);
+        input_fname_buf[fname.len] = 0;
+        break :blk input_fname_buf[0..fname.len :0];
+    };
+
+    var hts_reader = htslib.HtsVcfReader.open(input_fname_z) catch {
+        std.debug.print("Error: failed to open VCF file '{s}'\n", .{opts.input_fname.?});
         std.process.exit(1);
     };
-    defer reader.deinit();
+    defer hts_reader.close();
+
+    // Get the input header from htslib
+    const in_hdr = hts_reader.hdr.raw;
 
     // ---- Determine output mode ----
-    const use_hts_writer = (opts.output_type != 'v');
+    // Always use htslib writer: for -O v (text VCF) we use "w" mode,
+    // for -O b/z/u we use the appropriate binary mode.
+    // This avoids text serialization roundtrip for all output types.
+    const hts_mode: [*:0]const u8 = switch (opts.output_type) {
+        'b' => "wb",  // BCF compressed
+        'u' => "wbu", // BCF uncompressed
+        'z' => "wz",  // VCF compressed (bgzf)
+        else => "w",  // text VCF
+    };
 
-    // ---- Open output ----
-    // For text VCF (-O v): use std.fs.File directly.
-    // For BCF/compressed (-O b/z/u): use htslib HtsVcfWriter.
-    var out_file: std.fs.File = undefined;
-    var out_file_needs_close = false;
-    var hts_writer: ?htslib.HtsVcfWriter = null;
-    var hts_out_hdr: ?*htslib.c.bcf_hdr_t = null;
-    var hts_out_rec: ?*htslib.c.bcf1_t = null;
-
-    if (!use_hts_writer) {
-        if (opts.output_fname) |fname| {
-            out_file = std.fs.cwd().createFile(fname, .{}) catch |err| {
-                std.debug.print("Error: failed to open output file '{s}': {}\n", .{ fname, err });
-                std.process.exit(1);
-            };
-            out_file_needs_close = true;
-        } else {
-            out_file = stdout_file;
+    // ---- Open output via htslib ----
+    var out_fname_buf: [4096]u8 = undefined;
+    const out_fname_z: [*:0]const u8 = if (opts.output_fname) |fname| blk: {
+        if (fname.len >= out_fname_buf.len) {
+            stderr_file.writeAll("Error: output path too long\n") catch {};
+            std.process.exit(1);
         }
-    }
-    defer if (out_file_needs_close) out_file.close();
-    defer if (hts_writer) |*w| w.close();
-    defer if (hts_out_rec) |r| htslib.c.bcf_destroy(r);
-    // Note: hts_out_hdr is owned by the writer after writeHeader; do not destroy separately.
+        @memcpy(out_fname_buf[0..fname.len], fname);
+        out_fname_buf[fname.len] = 0;
+        break :blk out_fname_buf[0..fname.len :0];
+    } else "-"; // stdout
 
-    // ---- Build full header text (with BCSQ definitions injected) ----
-    // Regardless of output mode, we need the full header text for sample
-    // counting and (for htslib writer) bcf_hdr_t construction.
-    var header_text: std.ArrayList(u8) = .empty;
-    defer header_text.deinit(allocator);
-    var chrom_line: ?[]const u8 = null;
-    for (reader.header_lines.items) |hline| {
-        if (hline.len > 0 and hline[0] == '#' and (hline.len < 2 or hline[1] != '#')) {
-            chrom_line = hline;
-        } else {
-            header_text.appendSlice(allocator, hline) catch {};
-            header_text.append(allocator, '\n') catch {};
-        }
-    }
+    var hts_writer = htslib.HtsVcfWriter.open(out_fname_z, hts_mode) catch {
+        std.debug.print("Error: failed to open output\n", .{});
+        std.process.exit(1);
+    };
+    defer hts_writer.close();
+
+    // ---- Build output header: clone input header and add BCSQ definitions ----
+    const out_hdr = htslib.c.bcf_hdr_dup(in_hdr) orelse {
+        stderr_file.writeAll("Error: failed to duplicate BCF header\n") catch {};
+        std.process.exit(1);
+    };
 
     // Inject BCSQ INFO header line
     {
-        var bcsq_info: std.ArrayList(u8) = .empty;
-        defer bcsq_info.deinit(allocator);
-        bcsq_info.appendSlice(allocator, "##INFO=<ID=") catch {};
-        bcsq_info.appendSlice(allocator, opts.custom_tag) catch {};
-        bcsq_info.appendSlice(allocator, ",Number=.,Type=String,Description=\"Haplotype-aware consequence annotation from BCFtools/csq\">\n") catch {};
-        header_text.appendSlice(allocator, bcsq_info.items) catch {};
+        var bcsq_info_buf: [512]u8 = undefined;
+        const bcsq_info = std.fmt.bufPrint(&bcsq_info_buf, "##INFO=<ID={s},Number=.,Type=String,Description=\"Haplotype-aware consequence annotation from BCFtools/csq\">", .{opts.custom_tag}) catch {
+            stderr_file.writeAll("Error: BCSQ tag too long\n") catch {};
+            std.process.exit(1);
+        };
+        // bcf_hdr_append needs null-terminated string
+        var hdr_line_buf: [512]u8 = undefined;
+        @memcpy(hdr_line_buf[0..bcsq_info.len], bcsq_info);
+        hdr_line_buf[bcsq_info.len] = 0;
+        _ = htslib.c.bcf_hdr_append(out_hdr, &hdr_line_buf);
     }
 
     // Inject BCSQ FORMAT header line
     {
-        var bcsq_fmt: std.ArrayList(u8) = .empty;
-        defer bcsq_fmt.deinit(allocator);
-        bcsq_fmt.appendSlice(allocator, "##FORMAT=<ID=") catch {};
-        bcsq_fmt.appendSlice(allocator, opts.custom_tag) catch {};
-        bcsq_fmt.appendSlice(allocator, ",Number=.,Type=Integer,Description=\"Bitmask of indexes to consequence types listed in the INFO/") catch {};
-        bcsq_fmt.appendSlice(allocator, opts.custom_tag) catch {};
-        bcsq_fmt.appendSlice(allocator, " tag\">\n") catch {};
-        header_text.appendSlice(allocator, bcsq_fmt.items) catch {};
+        var bcsq_fmt_buf: [512]u8 = undefined;
+        const bcsq_fmt = std.fmt.bufPrint(&bcsq_fmt_buf, "##FORMAT=<ID={s},Number=.,Type=Integer,Description=\"Bitmask of indexes to consequence types listed in the INFO/{s} tag\">", .{ opts.custom_tag, opts.custom_tag }) catch {
+            stderr_file.writeAll("Error: BCSQ tag too long\n") catch {};
+            std.process.exit(1);
+        };
+        var hdr_line_buf2: [512]u8 = undefined;
+        @memcpy(hdr_line_buf2[0..bcsq_fmt.len], bcsq_fmt);
+        hdr_line_buf2[bcsq_fmt.len] = 0;
+        _ = htslib.c.bcf_hdr_append(out_hdr, &hdr_line_buf2);
     }
 
-    // Count samples from #CHROM line
-    var n_samples: u32 = 0;
-    if (chrom_line) |cl| {
-        header_text.appendSlice(allocator, cl) catch {};
-        header_text.append(allocator, '\n') catch {};
-        var tab_count: u32 = 0;
-        for (cl) |ch| {
-            if (ch == '\t') tab_count += 1;
-        }
-        if (tab_count >= 9) n_samples = tab_count - 8;
-    }
+    _ = htslib.c.bcf_hdr_sync(out_hdr);
 
-    // ---- Write header ----
-    if (use_hts_writer) {
-        // Determine htslib write mode from output type
-        const mode: [*:0]const u8 = switch (opts.output_type) {
-            'b' => "wb",  // BCF compressed
-            'u' => "wbu", // BCF uncompressed
-            'z' => "wz",  // VCF compressed (bgzf)
-            else => "w",  // text VCF fallback
-        };
-        var out_fname_buf: [4096]u8 = undefined;
-        const out_fname_z: [*:0]const u8 = if (opts.output_fname) |fname| blk: {
-            if (fname.len >= out_fname_buf.len) {
-                stderr_file.writeAll("Error: output path too long\n") catch {};
-                std.process.exit(1);
-            }
-            @memcpy(out_fname_buf[0..fname.len], fname);
-            out_fname_buf[fname.len] = 0;
-            break :blk out_fname_buf[0..fname.len :0];
-        } else "-"; // stdout
+    hts_writer.writeHeader(out_hdr) catch {
+        stderr_file.writeAll("Error: failed to write output header\n") catch {};
+        std.process.exit(1);
+    };
 
-        hts_writer = htslib.HtsVcfWriter.open(out_fname_z, mode) catch {
-            std.debug.print("Error: failed to open htslib output\n", .{});
-            std.process.exit(1);
-        };
-
-        // Build bcf_hdr_t from the assembled header text
-        // bcf_hdr_init expects "r" for reading mode (to parse header text)
-        const hdr = htslib.c.bcf_hdr_init("w") orelse {
-            stderr_file.writeAll("Error: failed to create BCF header\n") catch {};
-            std.process.exit(1);
-        };
-        // Null-terminate header text for htslib
-        header_text.append(allocator, 0) catch {};
-        if (htslib.c.bcf_hdr_parse(hdr, @ptrCast(header_text.items.ptr)) != 0) {
-            stderr_file.writeAll("Error: failed to parse BCF header\n") catch {};
-            std.process.exit(1);
-        }
-        hts_out_hdr = hdr;
-        hts_writer.?.writeHeader(hdr) catch {
-            stderr_file.writeAll("Error: failed to write BCF header\n") catch {};
-            std.process.exit(1);
-        };
-
-        // Allocate a reusable bcf1_t for record conversion
-        hts_out_rec = htslib.c.bcf_init() orelse {
-            stderr_file.writeAll("Error: failed to allocate BCF record\n") catch {};
-            std.process.exit(1);
-        };
-    } else {
-        // Text VCF output: write header directly
-        out_file.writeAll(header_text.items) catch |err| {
-            std.debug.print("Error: failed to write header: {}\n", .{err});
-            std.process.exit(1);
-        };
-    }
+    // Count samples from htslib header
+    const n_samples: u32 = @intCast(htslib.c.bcf_compat_nsamples(in_hdr));
 
     // When there are no samples, force drop_gt mode (matches C: line 726)
     var phase = opts.phase;
@@ -744,6 +769,9 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
     };
     defer csq_ctx.deinit();
 
+    // Set the htslib header for genotype extraction from bcf1_t records
+    csq_mod.setHtsHeader(in_hdr);
+
     // ---- Initialize filter (if -i or -e was given) ----
     var site_filter: ?Filter = null;
     if (opts.include_expr) |expr| {
@@ -759,89 +787,50 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
     }
     defer if (site_filter) |*f| f.deinit();
 
+    // Null-terminate the BCSQ tag for htslib calls
+    var bcsq_tag_buf: [256]u8 = undefined;
+    const bcsq_tag_z: [*:0]const u8 = blk: {
+        const tag = opts.custom_tag;
+        if (tag.len >= bcsq_tag_buf.len) {
+            stderr_file.writeAll("Error: BCSQ tag too long\n") catch {};
+            std.process.exit(1);
+        }
+        @memcpy(bcsq_tag_buf[0..tag.len], tag);
+        bcsq_tag_buf[tag.len] = 0;
+        break :blk bcsq_tag_buf[0..tag.len :0];
+    };
+
     // ---- Main processing loop ----
-    var rec = VcfRecord.init(allocator);
-    defer rec.deinit();
-
-    // Map from (rid, pos) -> original VCF text line.  The CSQ pipeline
-    // buffers records and flushes them later, so we need to keep the
-    // original lines alive until they are written.
-    // NOTE: multiple records at the same position will overwrite each other.
-    // This is acceptable for now; when htslib bindings replace text VCF
-    // reading, records will be managed by the pipeline's own Vbuf.
-    var line_map = std.AutoHashMap(u64, []const u8).init(allocator);
-    defer {
-        var it = line_map.valueIterator();
-        while (it.next()) |v| allocator.free(v.*);
-        line_map.deinit();
-    }
-
     var n_records: u64 = 0;
     var n_errors: u64 = 0;
 
-    while (true) {
-        const has_record = reader.next(&rec) catch |err| {
-            n_errors += 1;
-            if (n_errors <= 10) {
-                std.debug.print("Warning: failed to parse VCF record: {}\n", .{err});
-            }
-            continue;
-        };
-        if (!has_record) break;
-
+    while (hts_reader.next()) |hts_rec| {
         n_records += 1;
 
-        // Apply site filter (-i/-e) before processing
-        if (site_filter) |*sf| {
-            if (!sf.eval(&rec)) continue;
-        }
-
-        // Save the original line for later BCSQ injection.
-        // We must dupe it because rec._storage is reused on the next read.
-        if (rec._storage) |storage| {
-            const key = posKey(rec.rid, rec.pos);
-            const duped = try allocator.dupe(u8, storage);
-            try line_map.put(key, duped);
-        }
-
-        // Build a pipeline-compatible record and feed it through CsqContext
-        const csq_rec = buildCsqRecord(&rec);
+        // Build a pipeline-compatible record directly from bcf1_t
+        const csq_rec = buildCsqRecordFromHts(&hts_rec, &hts_reader.hdr);
         csq_ctx.process(&csq_rec) catch |err| {
             n_errors += 1;
             if (n_errors <= 10) {
-                std.debug.print("Warning: CSQ processing error at {s}:{d}: {}\n", .{ rec.chrom, rec.pos + 1, err });
+                std.debug.print("Warning: CSQ processing error at {s}:{d}: {}\n", .{ csq_rec.chr, csq_rec.pos + 1, err });
             }
         };
 
         // Write any records that were flushed by this process() call
-        if (use_hts_writer) {
-            writeFlushedRecordsHts(allocator, &hts_writer.?, hts_out_hdr.?, hts_out_rec.?, &csq_ctx, &line_map) catch |err| {
-                std.debug.print("Error: failed to write flushed records (hts): {}\n", .{err});
-                std.process.exit(1);
-            };
-        } else {
-            writeFlushedRecords(allocator, out_file, &csq_ctx, &line_map) catch |err| {
-                std.debug.print("Error: failed to write flushed records: {}\n", .{err});
-                std.process.exit(1);
-            };
-        }
+        writeFlushedRecordsDirect(allocator, &hts_writer, out_hdr, &csq_ctx, bcsq_tag_z, n_samples) catch |err| {
+            std.debug.print("Error: failed to write flushed records: {}\n", .{err});
+            std.process.exit(1);
+        };
     }
 
     // ---- Flush remaining buffered records ----
     csq_ctx.flush() catch |err| {
         std.debug.print("Warning: error flushing CSQ buffer: {}\n", .{err});
     };
-    if (use_hts_writer) {
-        writeFlushedRecordsHts(allocator, &hts_writer.?, hts_out_hdr.?, hts_out_rec.?, &csq_ctx, &line_map) catch |err| {
-            std.debug.print("Error: failed to write final flushed records (hts): {}\n", .{err});
-            std.process.exit(1);
-        };
-    } else {
-        writeFlushedRecords(allocator, out_file, &csq_ctx, &line_map) catch |err| {
-            std.debug.print("Error: failed to write final flushed records: {}\n", .{err});
-            std.process.exit(1);
-        };
-    }
+    writeFlushedRecordsDirect(allocator, &hts_writer, out_hdr, &csq_ctx, bcsq_tag_z, n_samples) catch |err| {
+        std.debug.print("Error: failed to write final flushed records: {}\n", .{err});
+        std.process.exit(1);
+    };
 
     if (n_errors > 0) {
         std.debug.print("Processed {d} records with {d} warnings/errors\n", .{ n_records, n_errors });

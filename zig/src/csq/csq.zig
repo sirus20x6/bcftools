@@ -14,6 +14,7 @@ const gff_mod = @import("../gff/gff.zig");
 const gff_types = @import("../gff/types.zig");
 const region = @import("../core/region.zig");
 const types = @import("types.zig");
+const hts_c = @import("../vcf/htslib.zig").c;
 
 const haplotype_mod = @import("haplotype.zig");
 const translate = @import("translate.zig");
@@ -191,6 +192,10 @@ pub const VcfRecord = struct {
     chr: []const u8 = "unknown",
     /// Raw VCF line for genotype parsing (optional, used for text VCF input).
     raw_line: ?[]const u8 = null,
+    /// Raw bcf1_t pointer for in-place modification (optional, used for htslib input).
+    /// When set, output can inject BCSQ directly into the bcf1_t and write via htslib
+    /// without text serialization roundtrip.
+    raw_bcf: ?*anyopaque = null,
     /// Cached parsed genotypes (one per sample, lazily populated).
     gt_cache: ?[]Genotype = null,
 
@@ -224,6 +229,11 @@ pub const VcfRecord = struct {
     pub fn parseGenotypes(self: *const VcfRecord, allocator: std.mem.Allocator) !?[]Genotype {
         // If already cached, return cached
         if (self.gt_cache) |cached| return cached;
+
+        // Fast path: extract genotypes directly from bcf1_t via htslib
+        if (self.raw_bcf) |raw_ptr| {
+            return self.parseGenotypesFromBcf(raw_ptr, allocator);
+        }
 
         const line = self.raw_line orelse return null;
 
@@ -292,7 +302,79 @@ pub const VcfRecord = struct {
 
         return genotypes;
     }
+
+    /// Extract genotypes from a bcf1_t record via htslib bcf_get_genotypes.
+    /// This avoids text parsing entirely.
+    fn parseGenotypesFromBcf(self: *const VcfRecord, raw_ptr: *anyopaque, allocator: std.mem.Allocator) !?[]Genotype {
+        _ = self;
+        const bcf_ptr: *hts_c.bcf1_t = @ptrCast(@alignCast(raw_ptr));
+
+        // We need the header to call bcf_get_genotypes. It's stored in a
+        // module-level variable set by the main loop.
+        const hdr = g_hts_hdr orelse return null;
+
+        var gt_arr: [*c]i32 = null;
+        var ngt: c_int = 0;
+        const ret = hts_c.bcf_compat_get_genotypes(hdr, bcf_ptr, @ptrCast(&gt_arr), &ngt);
+        if (ret <= 0) return null;
+        defer std.c.free(gt_arr);
+
+        const total: usize = @intCast(ret);
+        const n_samples_raw = hts_c.bcf_compat_nsamples(hdr);
+        if (n_samples_raw <= 0) return null;
+        const n_samples: usize = @intCast(n_samples_raw);
+        const ploidy = total / n_samples;
+        if (ploidy == 0) return null;
+
+        var genotypes = try allocator.alloc(Genotype, n_samples);
+
+        // Zig equivalents of htslib GT macros:
+        //   bcf_gt_is_missing(val) = (val >> 1) ? 0 : 1
+        //   bcf_gt_is_phased(val)  = val & 1
+        //   bcf_gt_allele(val)     = (val >> 1) - 1
+        // #define bcf_int32_vector_end (-2147483647)
+        const vec_end: i32 = -2147483647;
+
+        for (0..n_samples) |si| {
+            var g = Genotype{ .alleles = .{ -1, -1 }, .phased = false, .ploidy = @intCast(@min(ploidy, 2)) };
+            const base = si * ploidy;
+
+            for (0..@min(ploidy, 2)) |pi| {
+                const val = gt_arr[base + pi];
+                if (val == vec_end) {
+                    g.ploidy = @intCast(pi);
+                    break;
+                }
+                const uval: u32 = @bitCast(val);
+                const shifted = uval >> 1;
+                if (shifted == 0) {
+                    // bcf_gt_is_missing: (val>>1) == 0
+                    g.alleles[pi] = -1;
+                } else {
+                    // bcf_gt_allele: (val>>1) - 1
+                    g.alleles[pi] = @as(i32, @intCast(shifted)) - 1;
+                }
+                if (pi > 0 and (uval & 1) != 0) {
+                    // bcf_gt_is_phased: val & 1
+                    g.phased = true;
+                }
+            }
+            genotypes[si] = g;
+        }
+
+        return genotypes;
+    }
 };
+
+/// Module-level htslib header pointer, set by the main loop when using HtsVcfReader.
+/// Used by parseGenotypesFromBcf to call bcf_get_genotypes.
+var g_hts_hdr: ?*hts_c.bcf_hdr_t = null;
+
+/// Set the htslib header pointer for genotype extraction from bcf1_t records.
+/// Must be called before processing records that have raw_bcf set.
+pub fn setHtsHeader(hdr: *hts_c.bcf_hdr_t) void {
+    g_hts_hdr = hdr;
+}
 
 // ---------------------------------------------------------------------------
 // VCF record buffering types (port of vrec_t / vbuf_t / csq_t)
@@ -333,6 +415,10 @@ pub const Vrec = struct {
             }
             if (rec_ptr.raw_line) |rl| {
                 allocator.free(rl);
+            }
+            if (rec_ptr.raw_bcf) |raw_ptr| {
+                const bcf_ptr: *hts_c.bcf1_t = @ptrCast(@alignCast(raw_ptr));
+                hts_c.bcf_compat_destroy(bcf_ptr);
             }
             // rec is *const VcfRecord, need to cast to free
             const mutable: *VcfRecord = @constCast(rec_ptr);
@@ -1073,6 +1159,12 @@ pub const CsqContext = struct {
         if (rec.raw_line) |rl| {
             owned_rec.raw_line = try self.allocator.dupe(u8, rl);
         }
+        // Deep-copy bcf1_t via bcf_dup
+        if (rec.raw_bcf) |raw_ptr| {
+            const bcf_ptr: *hts_c.bcf1_t = @ptrCast(@alignCast(raw_ptr));
+            const duped = hts_c.bcf_compat_dup(bcf_ptr);
+            owned_rec.raw_bcf = @ptrCast(duped);
+        }
 
         // Add the record as a new Vrec
         var vrec = Vrec{};
@@ -1105,6 +1197,9 @@ pub const CsqContext = struct {
         fmt_bm: ?[]const u32 = null,
         /// Number of FORMAT integers per sample.
         nfmt: u32 = 0,
+        /// Raw bcf1_t pointer for in-place output (avoids text roundtrip).
+        /// When non-null, the caller can inject BCSQ directly and write via htslib.
+        raw_bcf: ?*anyopaque = null,
     };
 
     /// Comparison function for sorting consequences in BCSQ output.
@@ -1154,9 +1249,13 @@ pub const CsqContext = struct {
 
                 if (vrec.vcsqs.items.len == 0) {
                     // No consequences — record passes through unmodified
+                    // Transfer raw_bcf ownership to flushed record
+                    const raw_bcf_ptr = rec_ptr.raw_bcf;
+                    @constCast(rec_ptr).raw_bcf = null;
                     try self.flushed_records.append(self.allocator, .{
                         .pos = rec_ptr.pos,
                         .rid = rec_ptr.rid,
+                        .raw_bcf = raw_bcf_ptr,
                     });
                     continue;
                 }
@@ -1184,12 +1283,16 @@ pub const CsqContext = struct {
                 // Dupe the formatted string so it outlives the output buffer reuse
                 const bcsq_str = try self.allocator.dupe(u8, self.output.items);
 
+                // Transfer raw_bcf ownership to flushed record
+                const raw_bcf_ptr = rec_ptr.raw_bcf;
+                @constCast(rec_ptr).raw_bcf = null;
                 try self.flushed_records.append(self.allocator, .{
                     .pos = rec_ptr.pos,
                     .rid = rec_ptr.rid,
                     .bcsq_value = bcsq_str,
                     .fmt_bm = vrec.fmt_bm,
                     .nfmt = vrec.nfmt,
+                    .raw_bcf = raw_bcf_ptr,
                 });
                 // Transfer ownership of fmt_bm to the flushed record
                 // so that vrec.deinit() won't free it.
