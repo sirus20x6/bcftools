@@ -8,6 +8,7 @@ pub fn RegionIndex(comptime Payload: type) type {
             beg: u32,
             end: u32,
             insert_order: u32 = 0, // preserves GFF insertion order for stable sorting
+            max_end: u32 = 0, // max(end) for all intervals at this index and before (set after sort)
             payload: Payload,
         };
 
@@ -76,6 +77,12 @@ pub fn RegionIndex(comptime Payload: type) type {
                         return a.insert_order < b.insert_order;
                     }
                 }.lessThan);
+                // Build prefix max-end cache for fast overlap scan-start
+                var running_max: u32 = 0;
+                for (entry.value_ptr.items) |*iv| {
+                    running_max = @max(running_max, iv.end);
+                    iv.max_end = running_max;
+                }
             }
             self.sorted = true;
         }
@@ -88,8 +95,12 @@ pub fn RegionIndex(comptime Payload: type) type {
             // overlap, so we trim the slice.  The iterator still checks
             // end >= query_beg for each entry (since end values are not monotonic).
             const hi = upperBound(intervals, end);
+            // Binary search: find first index where max_end >= query_beg.
+            // All intervals before that index have max_end < query_beg,
+            // meaning none of them can overlap the query.
+            const lo = lowerBoundMaxEnd(intervals[0..hi], beg);
             return .{
-                .intervals = intervals[0..hi],
+                .intervals = intervals[lo..hi],
                 .idx = 0,
                 .query_beg = beg,
                 .query_end = end,
@@ -98,6 +109,23 @@ pub fn RegionIndex(comptime Payload: type) type {
 
         pub fn hasSeq(self: *const Self, seq: []const u8) bool {
             return self.sequences.contains(seq);
+        }
+
+        /// Find the first index where max_end >= target_beg.
+        /// All intervals before this index have max_end < target_beg,
+        /// meaning none of them (or any earlier interval) can overlap.
+        fn lowerBoundMaxEnd(intervals: []const Interval, target_beg: u32) usize {
+            var lo: usize = 0;
+            var hi: usize = intervals.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (intervals[mid].max_end < target_beg) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            return lo;
         }
 
         /// Find the first index where interval.beg > target.

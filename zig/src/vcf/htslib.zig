@@ -6,6 +6,7 @@ pub const c = @cImport({
     @cInclude("htslib/synced_bcf_reader.h");
     @cInclude("htslib/faidx.h");
     @cInclude("htslib/kstring.h");
+    @cInclude("vcf/bcf_compat.h");
 });
 
 pub const HtsHeader = struct {
@@ -30,31 +31,31 @@ pub const HtsRecord = struct {
     raw: *c.bcf1_t,
 
     pub fn pos(self: *const HtsRecord) u32 {
-        return @intCast(self.raw.pos);
+        return @intCast(c.bcf_compat_pos(self.raw));
     }
 
     pub fn rid(self: *const HtsRecord) i32 {
-        return self.raw.rid;
+        return @intCast(c.bcf_compat_rid(self.raw));
     }
 
     pub fn nAllele(self: *const HtsRecord) u32 {
-        return @intCast(self.raw.n_allele);
+        return @intCast(c.bcf_compat_n_allele(self.raw));
     }
 
     pub fn rlen(self: *const HtsRecord) u32 {
-        return @intCast(self.raw.rlen);
+        return @intCast(c.bcf_compat_rlen(self.raw));
     }
 
     pub fn allele(self: *const HtsRecord, idx: usize) []const u8 {
         // Need to unpack first
         _ = c.bcf_unpack(self.raw, c.BCF_UN_STR);
-        const alleles = self.raw.d.allele;
+        const alleles = c.bcf_compat_alleles(self.raw);
         if (alleles == null) return "";
         return std.mem.span(alleles[idx]);
     }
 
     pub fn seqname(self: *const HtsRecord, hdr: *const HtsHeader) []const u8 {
-        return hdr.seqName(self.raw.rid);
+        return hdr.seqName(@intCast(c.bcf_compat_rid(self.raw)));
     }
 };
 

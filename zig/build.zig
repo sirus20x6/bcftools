@@ -12,6 +12,13 @@ pub fn build(b: *std.Build) void {
     });
     // Link htslib for @cImport in vcf/htslib.zig
     lib_mod.addIncludePath(.{ .cwd_relative = "../../htslib" });
+    // Add src/ so vcf/bcf_compat.h can be found by @cInclude
+    lib_mod.addIncludePath(.{ .cwd_relative = "src" });
+    // Compile bcf_compat.c accessor functions for bcf1_t bitfield access
+    lib_mod.addCSourceFile(.{
+        .file = b.path("src/vcf/bcf_compat.c"),
+        .flags = &.{"-I../../htslib", "-Isrc"},
+    });
     lib_mod.addLibraryPath(.{ .cwd_relative = "../../htslib" });
     lib_mod.linkSystemLibrary("hts", .{});
     lib_mod.linkSystemLibrary("z", .{});

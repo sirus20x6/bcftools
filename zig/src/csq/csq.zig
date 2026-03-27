@@ -500,6 +500,9 @@ pub const Options = struct {
     n_samples: u32 = 0,
     /// Indices of selected samples.  If null, all samples are used.
     sample_indices: ?[]const u32 = null,
+    /// Opaque pointer to a bcf_hdr_t.  Used by the C API bridge
+    /// (bcftools_csq_process) to resolve rid -> chromosome name.
+    hdr_ptr: ?*anyopaque = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -520,6 +523,10 @@ pub const CsqContext = struct {
     fasta_fname: []const u8,
     fai_ptr: ?FaidxPtr,
     fetch_seq_fn: ?FetchSeqFn,
+
+    // BCF header pointer — used by C API bridge (bcftools_csq_process)
+    // to resolve rid -> chromosome name via bcf_hdr_id2name.
+    hdr_ptr: ?*anyopaque,
 
     // VCF record buffering
     pos2vbuf: std.AutoHashMap(u32, usize), // pos -> ring buffer index (for existence check)
@@ -607,6 +614,7 @@ pub const CsqContext = struct {
             .fasta_fname = options.fasta_fname,
             .fai_ptr = options.fai_ptr,
             .fetch_seq_fn = options.fetch_seq_fn,
+            .hdr_ptr = options.hdr_ptr,
             .pos2vbuf = std.AutoHashMap(u32, usize).init(allocator),
             .vcf_rbuf = try RingBuffer(*Vbuf).init(allocator, 64),
             .active_transcripts = ActiveTranscriptQueue.init(allocator, {}),
