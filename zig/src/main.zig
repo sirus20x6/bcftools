@@ -49,8 +49,8 @@ const csq_usage_text =
     \\  -e, --exclude EXPR          Exclude sites for which the expression is true
     \\  -i, --include EXPR          Include only sites for which the expression is true
     \\  -o, --output FILE           Write output to FILE [standard output]
-    \\  -O, --output-type b|u|z|v   b: compressed BCF, u: uncompressed BCF,
-    \\                              z: compressed VCF, v: uncompressed VCF [v]
+    \\  -O, --output-type v         Only uncompressed VCF is currently supported [v]
+    \\                              (BCF/compressed output requires htslib writer)
     \\  -r, --regions REGION        Restrict to comma-separated list of regions
     \\  -R, --regions-file FILE     Restrict to regions listed in FILE
     \\  -s, --samples LIST          Samples to include
@@ -402,9 +402,12 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
         std.process.exit(1);
     }
 
-    // Only text VCF output is supported for now (no htslib BCF writing).
+    // Only uncompressed text VCF output (-O v) is supported.  BCF and
+    // compressed VCF output require the htslib BCF writer which is available
+    // via vcf/htslib.zig but not yet wired into the output path.
     if (opts.output_type != 'v') {
-        stderr_file.writeAll("Error: only uncompressed VCF output (-O v) is currently supported\n") catch {};
+        stderr_file.writeAll("Error: only uncompressed VCF output (-O v) is currently supported.\n" ++
+            "BCF/compressed output requires the htslib writer (not yet wired in).\n") catch {};
         std.process.exit(1);
     }
 

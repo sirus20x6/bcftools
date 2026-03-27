@@ -2240,7 +2240,7 @@ pub const CsqContext = struct {
                     alt,
                 );
 
-                const splice_ret = splice.spliceCsq(utr.beg, utr.end);
+                const splice_ret = try splice.spliceCsq(utr.beg, utr.end);
                 if (splice_ret != .inside and splice_ret != .overlap) {
                     // For insertions at the exact CDS/UTR boundary (e.g. last CDS base
                     // where the insertion position equals the UTR start), spliceCsq
@@ -2345,7 +2345,7 @@ pub const CsqContext = struct {
                 splice.flags.check_region_beg = check_region_beg;
                 splice.flags.check_region_end = check_region_end;
 
-                _ = splice.spliceCsq(exon.beg, exon.end);
+                _ = try splice.spliceCsq(exon.beg, exon.end);
 
                 // If any splice consequence was set, stage it
                 if (splice.csq.toInt() != 0) {
@@ -2473,7 +2473,7 @@ pub const CsqContext = struct {
                 // Pre-set csq to csq_class so splice adds to it (C: splice.csq = csq_class)
                 splice.csq = types.CsqType.fromInt(csq_class);
 
-                _ = splice.spliceCsq(exon.beg, exon.end);
+                _ = try splice.spliceCsq(exon.beg, exon.end);
 
                 if (splice.csq.toInt() != 0) {
                     var csq = Csq{
@@ -2556,7 +2556,7 @@ pub const CsqContext = struct {
                     alt,
                 );
 
-                const splice_ret = splice.spliceCsq(tr.beg, tr.end);
+                const splice_ret = try splice.spliceCsq(tr.beg, tr.end);
                 if (splice_ret != .inside and splice_ret != .overlap) continue;
 
                 // Coding transcript -> INTRON; non-coding -> NON_CODING

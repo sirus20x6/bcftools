@@ -655,7 +655,7 @@ pub fn hapInit(
     splice.tr_ref = tscript_aux.ref_seq;
 
     // Run splice consequence analysis
-    const ret = splice.spliceCsq(cds.beg, cds.beg + cds.len - 1);
+    const ret = try splice.spliceCsq(cds.beg, cds.beg + cds.len - 1);
 
     // ── Step 2: handle non-coding results ──────────────────────────
 
