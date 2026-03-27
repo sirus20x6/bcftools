@@ -39,7 +39,10 @@ const HapContext = haplotype_mod.HapContext;
 /// Used to determine which transcripts have been fully traversed at a given
 /// genomic position so their haplotype trees can be finalized.
 fn trLessThan(_: void, a: *Transcript, b: *Transcript) std.math.Order {
-    return std.math.order(a.end, b.end);
+    const end_cmp = std.math.order(a.end, b.end);
+    if (end_cmp != .eq) return end_cmp;
+    // Break ties by transcript id (smaller id = earlier in GFF = first)
+    return std.math.order(a.id, b.id);
 }
 const ActiveTranscriptQueue = std.PriorityQueue(*Transcript, void, trLessThan);
 

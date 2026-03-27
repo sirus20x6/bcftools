@@ -7,6 +7,7 @@ pub fn RegionIndex(comptime Payload: type) type {
         pub const Interval = struct {
             beg: u32,
             end: u32,
+            insert_order: u32 = 0, // preserves GFF insertion order for stable sorting
             payload: Payload,
         };
 
@@ -37,6 +38,7 @@ pub fn RegionIndex(comptime Payload: type) type {
         sequences: std.StringHashMap(std.ArrayList(Interval)),
         sorted: bool,
         allocator: std.mem.Allocator,
+        next_insert_order: u32 = 0,
 
         pub fn init(alloc: std.mem.Allocator) Self {
             return .{
@@ -59,7 +61,8 @@ pub fn RegionIndex(comptime Payload: type) type {
             if (!result.found_existing) {
                 result.value_ptr.* = .empty;
             }
-            try result.value_ptr.append(self.allocator, .{ .beg = beg, .end = end, .payload = payload });
+            try result.value_ptr.append(self.allocator, .{ .beg = beg, .end = end, .insert_order = self.next_insert_order, .payload = payload });
+            self.next_insert_order += 1;
             self.sorted = false;
         }
 
@@ -68,7 +71,9 @@ pub fn RegionIndex(comptime Payload: type) type {
             while (it.next()) |entry| {
                 std.mem.sort(Interval, entry.value_ptr.items, {}, struct {
                     fn lessThan(_: void, a: Interval, b: Interval) bool {
-                        return if (a.beg != b.beg) a.beg < b.beg else a.end < b.end;
+                        if (a.beg != b.beg) return a.beg < b.beg;
+                        if (a.end != b.end) return a.end < b.end;
+                        return a.insert_order < b.insert_order;
                     }
                 }.lessThan);
             }
