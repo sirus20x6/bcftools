@@ -522,8 +522,8 @@ pub const CsqContext = struct {
     // Haplotype processing
     hap_ctx: HapContext,
 
-    // Thread pool for parallel hapFinalize
-    thread_pool: ?std.Thread.Pool,
+    // Thread pool for parallel hapFinalize (heap-allocated to ensure stable address for worker threads)
+    thread_pool: ?*std.Thread.Pool,
     n_threads: u32,
 
     // FASTA reference access
@@ -619,17 +619,22 @@ pub const CsqContext = struct {
         else
             options.n_threads;
 
-        // Initialize thread pool when using more than one thread
-        var pool: ?std.Thread.Pool = null;
+        // Initialize thread pool when using more than one thread.
+        // Heap-allocated so the Pool address is stable after CsqContext is returned
+        // (worker threads capture a pointer to the Pool during init).
+        var pool: ?*std.Thread.Pool = null;
         if (effective_threads > 1) {
-            var p: std.Thread.Pool = undefined;
+            const p = try allocator.create(std.Thread.Pool);
             try p.init(.{
                 .allocator = allocator,
                 .n_jobs = effective_threads,
             });
             pool = p;
         }
-        errdefer if (pool) |*p| p.deinit();
+        errdefer if (pool) |p| {
+            p.deinit();
+            allocator.destroy(p);
+        };
 
         return CsqContext{
             .allocator = allocator,
@@ -692,7 +697,10 @@ pub const CsqContext = struct {
         self.gt_cache = null;
         self.gt_cache_rec = null;
         // Clean up thread pool
-        if (self.thread_pool) |*pool| pool.deinit();
+        if (self.thread_pool) |pool| {
+            pool.deinit();
+            self.allocator.destroy(pool);
+        }
         // Clean up haplotype context
         self.hap_ctx.deinit();
         // Clean up any remaining transcripts in the removal list
@@ -1314,7 +1322,7 @@ pub const CsqContext = struct {
         transcripts: []*Transcript,
         has_tree: []const bool,
     ) !void {
-        var pool = &(self.thread_pool orelse return);
+        const pool = self.thread_pool orelse return;
         const gencode = self.hap_ctx.gencode;
         const allocator = self.allocator;
 
