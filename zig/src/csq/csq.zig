@@ -1059,22 +1059,11 @@ pub const CsqContext = struct {
         // Match C's output order: non-CDS consequences first (pushed during
         // process by testUtr/testSplice/testTscript), then CDS consequences
         // (appended later by hapFlush/transferTreeCsqToVbuf).
-        // Splice-only consequences (no CDS overlap) — pushed first by testSplice
-        if (v.csq_type & (CSQ_SPLICE_ACCEPTOR | CSQ_SPLICE_DONOR | CSQ_SPLICE_REGION) != 0 and
-            v.csq_type & CSQ_COMPOUND == 0)
-            return 0;
-        // UTR — pushed by testUtr
-        if (v.csq_type & (CSQ_UTR5 | CSQ_UTR3) != 0) return 1;
-        // Non-coding/intron — pushed by testTscript
-        if (v.csq_type & (CSQ_INTRON | CSQ_NON_CODING) != 0) return 2;
-        // CDS-level consequences (compound or start/stop retained) — from hapFlush
-        if (v.csq_type & CSQ_COMPOUND != 0 or
-            v.csq_type & (CSQ_START_RETAINED | CSQ_STOP_RETAINED) != 0)
-            return 3;
-        // PRINTED_UPSTREAM back-references — after the consequence they reference
-        if (v.csq_type & CSQ_PRINTED_UPSTREAM != 0) return 4;
-        // Everything else
-        return 5;
+        // Preserve insertion order — don't sort. Return 0 for all entries
+        // so the stable sort maintains the original push order.
+        // The C code outputs consequences in csq_push insertion order.
+        _ = v;
+        return 0;
     }
 
     /// Flush all buffered VCF records whose keep_until <= pos.
