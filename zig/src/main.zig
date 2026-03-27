@@ -11,6 +11,7 @@ const Phase = csq_mod.Phase;
 const Filter = lib.filter.Filter;
 const StatsContext = lib.stats.StatsContext;
 const NormContext = lib.norm.NormContext;
+const MergeContext = lib.merge.MergeContext;
 
 /// Adapter function: bridges CsqContext.FetchSeqFn to HtsFaidx.fetchSeq
 fn htsFaidxFetchAdapter(ctx: *anyopaque, allocator: std.mem.Allocator, chr: [*:0]const u8, beg: i64, end: i64) ?[]u8 {
@@ -24,6 +25,7 @@ const usage_text =
     \\
     \\Commands:
     \\  csq        Haplotype-aware consequence caller
+    \\  merge      Merge multiple VCF/BCF files
     \\  stats      Produce VCF/BCF file stats
     \\
     \\Options:
@@ -1015,6 +1017,11 @@ pub fn main() !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "merge")) {
+        try runMerge(&args);
+        return;
+    }
+
     if (std.mem.eql(u8, command, "norm")) {
         try runNorm(&args);
         return;
@@ -1118,5 +1125,122 @@ fn runNorm(args: *std.process.ArgIterator) !void {
                 out_file.writeAll("\n") catch {};
             }
         }
+    }
+}
+
+// -------------------------------------------------------------------------
+// merge subcommand
+// -------------------------------------------------------------------------
+
+const merge_usage_text =
+    \\
+    \\About: Merge multiple VCF/BCF files into one multi-sample file.
+    \\Usage: bcftools-zig merge [OPTIONS] file1.vcf file2.vcf [file3.vcf ...]
+    \\
+    \\Options:
+    \\  -o, --output FILE         Write output to FILE [standard output]
+    \\  -O, --output-type v       Output type (v: text VCF) [v]
+    \\  -m, --merge STRING        Merge mode: snps|indels|both|all|none [both]
+    \\      --force-samples       Allow duplicate sample names
+    \\  -h, --help                Show this help message
+    \\
+;
+
+fn runMerge(args_iter: *std.process.ArgIterator) !void {
+    const allocator = std.heap.page_allocator;
+    const stderr_f = std.fs.File{ .handle = std.posix.STDERR_FILENO };
+    const stdout_f = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
+
+    var output_fname: ?[]const u8 = null;
+    var force_samples = false;
+    var show_help = false;
+    var merge_mode: MergeContext.Options = .{};
+
+    // Collect positional arguments (input files)
+    var input_files: std.ArrayList([]const u8) = .empty;
+    defer input_files.deinit(allocator);
+
+    while (args_iter.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            show_help = true;
+        } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            output_fname = args_iter.next();
+        } else if (std.mem.eql(u8, arg, "-O") or std.mem.eql(u8, arg, "--output-type")) {
+            _ = args_iter.next(); // consume, only -O v supported
+        } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--merge")) {
+            const val = args_iter.next() orelse continue;
+            if (std.mem.eql(u8, val, "none")) {
+                merge_mode.merge_mode = .none;
+            } else if (std.mem.eql(u8, val, "snps")) {
+                merge_mode.merge_mode = .snps;
+            } else if (std.mem.eql(u8, val, "indels")) {
+                merge_mode.merge_mode = .indels;
+            } else if (std.mem.eql(u8, val, "both")) {
+                merge_mode.merge_mode = .both;
+            } else if (std.mem.eql(u8, val, "all")) {
+                merge_mode.merge_mode = .all;
+            }
+        } else if (std.mem.eql(u8, arg, "--force-samples")) {
+            force_samples = true;
+        } else if (arg.len > 0 and arg[0] != '-') {
+            try input_files.append(allocator, arg);
+        }
+    }
+
+    if (show_help) {
+        stdout_f.writeAll(merge_usage_text) catch {};
+        return;
+    }
+
+    if (input_files.items.len < 2) {
+        stderr_f.writeAll("Error: merge requires at least 2 input VCF files\n") catch {};
+        stderr_f.writeAll(merge_usage_text) catch {};
+        std.process.exit(1);
+    }
+
+    merge_mode.force_samples = force_samples;
+
+    var ctx = MergeContext.init(allocator, input_files.items, merge_mode) catch |err| {
+        switch (err) {
+            error.DuplicateSampleName => {
+                stderr_f.writeAll("Error: duplicate sample names across files. Use --force-samples to allow.\n") catch {};
+                std.process.exit(1);
+            },
+            else => {
+                std.debug.print("Error: failed to initialize merge context: {}\n", .{err});
+                std.process.exit(1);
+            },
+        }
+    };
+    defer ctx.deinit();
+
+    // Open output
+    const out_file = if (output_fname) |fname|
+        std.fs.cwd().createFile(fname, .{}) catch {
+            std.debug.print("Error: failed to open output '{s}'\n", .{fname});
+            std.process.exit(1);
+        }
+    else
+        stdout_f;
+    defer if (output_fname != null) out_file.close();
+
+    // Write merged header
+    ctx.writeHeader(out_file) catch |err| {
+        std.debug.print("Error: failed to write header: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    // Main merge loop
+    while (true) {
+        const line = ctx.next() catch |err| {
+            std.debug.print("Warning: merge error: {}\n", .{err});
+            continue;
+        };
+        if (line == null) break;
+        out_file.writeAll(line.?) catch |err| {
+            std.debug.print("Error: failed to write record: {}\n", .{err});
+            std.process.exit(1);
+        };
+        out_file.writeAll("\n") catch {};
     }
 }

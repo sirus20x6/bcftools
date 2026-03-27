@@ -18,6 +18,7 @@ pub const vcf_htslib = @import("vcf/htslib.zig");
 pub const filter = @import("filter/filter.zig");
 pub const stats = @import("stats/stats.zig");
 pub const norm = @import("norm/norm.zig");
+pub const merge = @import("merge/merge.zig");
 pub const vcf_native = @import("vcf/native_reader.zig");
 
 const CsqContext = csq_pipeline.CsqContext;
@@ -132,4 +133,5 @@ comptime {
     _ = vcf_reader;
     _ = filter;
     _ = stats;
+    _ = merge;
 }
