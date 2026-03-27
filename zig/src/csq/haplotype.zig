@@ -371,6 +371,38 @@ fn appendCodonRev(
 }
 
 // ---------------------------------------------------------------------------
+// SIMD-accelerated byte comparison
+// ---------------------------------------------------------------------------
+
+/// Find the first position where two byte slices differ.
+/// Returns null if they are identical over the compared range.
+pub fn simdFirstMismatch(a: []const u8, b: []const u8) ?usize {
+    const len = @min(a.len, b.len);
+    var i: usize = 0;
+
+    // SIMD: compare 16 bytes at a time
+    while (i + 16 <= len) {
+        const va: @Vector(16, u8) = a[i..][0..16].*;
+        const vb: @Vector(16, u8) = b[i..][0..16].*;
+        const neq: @Vector(16, bool) = va != vb;
+        // Check if any mismatch in this chunk
+        if (@reduce(.Or, neq)) {
+            // Find first mismatch position via bitmask
+            const mask: u16 = @bitCast(neq);
+            return i + @ctz(mask);
+        }
+        i += 16;
+    }
+
+    // Scalar fallback
+    while (i < len) {
+        if (a[i] != b[i]) return i;
+        i += 1;
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
 // hapAddCsq — determine consequence type from translated ref vs alt protein
 // ---------------------------------------------------------------------------
 
@@ -496,18 +528,23 @@ pub fn hapAddCsq(
                 csq.stop_gained = true;
             }
         } else {
-            // Substitution: compare amino acids one by one
+            // Substitution: use SIMD to skip identical prefix, then classify changes
             var aa_change = false;
             const cmp_len = @min(tref_trunc.len, tseq_trunc.len);
-            for (0..cmp_len) |idx| {
-                if (tref_trunc[idx] == tseq_trunc[idx]) continue;
-                aa_change = true;
-                if (tref_stop_trunc[idx] == '*') {
-                    csq.stop_lost = true;
-                } else if (tseq_stop_trunc[idx] == '*') {
-                    csq.stop_gained = true;
-                } else {
-                    csq.missense_variant = true;
+            // Use SIMD to find the first mismatch position
+            const first_diff = simdFirstMismatch(tref_trunc[0..cmp_len], tseq_trunc[0..cmp_len]);
+            if (first_diff) |start_idx| {
+                // There is at least one difference; classify all from start_idx
+                for (start_idx..cmp_len) |idx| {
+                    if (tref_trunc[idx] == tseq_trunc[idx]) continue;
+                    aa_change = true;
+                    if (tref_stop_trunc[idx] == '*') {
+                        csq.stop_lost = true;
+                    } else if (tseq_stop_trunc[idx] == '*') {
+                        csq.stop_gained = true;
+                    } else {
+                        csq.missense_variant = true;
+                    }
                 }
             }
             if (!aa_change) {
@@ -2060,4 +2097,42 @@ test "hapFinalize merges compound variants in same codon" {
     child1.children.deinit(allocator);
     child1.csq_list.deinit(allocator);
     child1.cur_child.deinit(allocator);
+}
+
+test "simdFirstMismatch — identical short strings" {
+    const a = "MPRQST";
+    const b = "MPRQST";
+    try std.testing.expect(simdFirstMismatch(a, b) == null);
+}
+
+test "simdFirstMismatch — first byte differs" {
+    const a = "XPRQST";
+    const b = "MPRQST";
+    try std.testing.expectEqual(@as(usize, 0), simdFirstMismatch(a, b).?);
+}
+
+test "simdFirstMismatch — last byte differs" {
+    const a = "MPRQSX";
+    const b = "MPRQST";
+    try std.testing.expectEqual(@as(usize, 5), simdFirstMismatch(a, b).?);
+}
+
+test "simdFirstMismatch — long identical strings (exercises SIMD path)" {
+    const a = "ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEF";
+    const b = "ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEF";
+    try std.testing.expect(simdFirstMismatch(a, b) == null);
+}
+
+test "simdFirstMismatch — mismatch in second SIMD chunk" {
+    // 32 bytes: first 16 identical, mismatch at position 20
+    const a = "ABCDEFGHIJKLMNOPQRST" ++ "UVWXYZ123456";
+    const b = "ABCDEFGHIJKLMNOPQRS_" ++ "UVWXYZ123456";
+    try std.testing.expectEqual(@as(usize, 19), simdFirstMismatch(a, b).?);
+}
+
+test "simdFirstMismatch — mismatch in scalar fallback region" {
+    // 20 bytes: first 16 identical (SIMD), then mismatch at 18 (scalar)
+    const a = "ABCDEFGHIJKLMNOPQRST";
+    const b = "ABCDEFGHIJKLMNOPQX_T";
+    try std.testing.expectEqual(@as(usize, 17), simdFirstMismatch(a, b).?);
 }

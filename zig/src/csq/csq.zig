@@ -702,9 +702,26 @@ pub const CsqContext = struct {
     }
 
     /// Uppercase a byte slice in-place (ASCII only).
+    /// Uses SIMD to process 16 bytes at a time for long sequences.
     fn uppercaseInPlace(seq: []u8) void {
-        for (seq) |*c| {
-            if (c.* >= 'a' and c.* <= 'z') c.* -= 32;
+        var i: usize = 0;
+        // SIMD: process 16 bytes at a time
+        while (i + 16 <= seq.len) {
+            var chunk: @Vector(16, u8) = seq[i..][0..16].*;
+            const lower_a: @Vector(16, u8) = @splat('a');
+            const lower_z: @Vector(16, u8) = @splat('z');
+            const ge_a: @Vector(16, bool) = chunk >= lower_a;
+            const le_z: @Vector(16, bool) = chunk <= lower_z;
+            const is_lower = @select(bool, ge_a, le_z, @as(@Vector(16, bool), @splat(false)));
+            const adjustment = @select(u8, is_lower, @as(@Vector(16, u8), @splat(32)), @as(@Vector(16, u8), @splat(0)));
+            chunk -= adjustment;
+            seq[i..][0..16].* = chunk;
+            i += 16;
+        }
+        // Scalar fallback for remaining bytes
+        while (i < seq.len) {
+            if (seq[i] >= 'a' and seq[i] <= 'z') seq[i] -= 32;
+            i += 1;
         }
     }
 
@@ -4166,4 +4183,48 @@ test "icsq2ToBit: basic calculations" {
     const r61 = CsqContext.icsq2ToBit(61);
     try std.testing.expectEqual(@as(u32, 2), r61.ival);
     try std.testing.expectEqual(@as(u5, 1), r61.ibit);
+}
+
+test "uppercaseInPlace: short string (scalar path)" {
+    var buf = "abcDEF".*;
+    CsqContext.uppercaseInPlace(&buf);
+    try std.testing.expectEqualStrings("ABCDEF", &buf);
+}
+
+test "uppercaseInPlace: 16-byte aligned (SIMD path)" {
+    var buf = "abcdefghijklmnop".*;
+    CsqContext.uppercaseInPlace(&buf);
+    try std.testing.expectEqualStrings("ABCDEFGHIJKLMNOP", &buf);
+}
+
+test "uppercaseInPlace: mixed case with SIMD + scalar fallback" {
+    var buf = "abcDefGhIJKLmnopQrSt".*;
+    CsqContext.uppercaseInPlace(&buf);
+    try std.testing.expectEqualStrings("ABCDEFGHIJKLMNOPQRST", &buf);
+}
+
+test "uppercaseInPlace: non-alpha characters preserved" {
+    var buf = "abc123!@#DEF456_xyz".*;
+    CsqContext.uppercaseInPlace(&buf);
+    try std.testing.expectEqualStrings("ABC123!@#DEF456_XYZ", &buf);
+}
+
+test "uppercaseInPlace: empty slice" {
+    var buf: [0]u8 = .{};
+    CsqContext.uppercaseInPlace(&buf);
+}
+
+test "uppercaseInPlace: already uppercase" {
+    var buf = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".*;
+    CsqContext.uppercaseInPlace(&buf);
+    try std.testing.expectEqualStrings("ABCDEFGHIJKLMNOPQRSTUVWXYZ", &buf);
+}
+
+test "uppercaseInPlace: long sequence spanning multiple SIMD chunks" {
+    var buf: [50]u8 = undefined;
+    for (&buf, 0..) |*c, i| c.* = @intCast('a' + @as(u8, @intCast(i % 26)));
+    CsqContext.uppercaseInPlace(&buf);
+    for (buf, 0..) |c, i| {
+        try std.testing.expectEqual(@as(u8, @intCast('A' + @as(u8, @intCast(i % 26)))), c);
+    }
 }

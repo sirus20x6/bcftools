@@ -147,6 +147,90 @@ pub inline fn icsq2ToBit(icsq2: u32) u32 {
 }
 
 // ---------------------------------------------------------------------------
+// SIMD-accelerated nucleotide encoding
+// ---------------------------------------------------------------------------
+
+/// Encode 16 nucleotides to nt4 values using SIMD.
+/// Returns a vector of u8 values: 0=A, 1=C, 2=G, 3=T, 4=other.
+pub fn encodeNt4x16(input: [16]u8) @Vector(16, u8) {
+    const vec: @Vector(16, u8) = input;
+    // Clear bit 5 (0x20) to handle both upper and lowercase
+    const upper = vec & @as(@Vector(16, u8), @splat(@as(u8, 0xDF)));
+
+    const is_a = upper == @as(@Vector(16, u8), @splat(@as(u8, 'A')));
+    const is_c = upper == @as(@Vector(16, u8), @splat(@as(u8, 'C')));
+    const is_g = upper == @as(@Vector(16, u8), @splat(@as(u8, 'G')));
+    const is_t = upper == @as(@Vector(16, u8), @splat(@as(u8, 'T')));
+
+    const zero: @Vector(16, u8) = @splat(0);
+    const one: @Vector(16, u8) = @splat(1);
+    const two: @Vector(16, u8) = @splat(2);
+    const three: @Vector(16, u8) = @splat(3);
+    const four: @Vector(16, u8) = @splat(4);
+
+    var result = four; // default: invalid
+    result = @select(u8, is_t, three, result);
+    result = @select(u8, is_g, two, result);
+    result = @select(u8, is_c, one, result);
+    result = @select(u8, is_a, zero, result);
+
+    return result;
+}
+
+/// Batch translate a DNA sequence to amino acids using SIMD-accelerated encoding.
+/// Input: DNA sequence (codons read from seq, length must be a multiple of 3).
+/// Output: amino acid characters written to `out`.
+/// Returns number of amino acids written.
+pub fn batchTranslate(code: *const GeneticCode, seq: []const u8, out: []u8) usize {
+    var aa_idx: usize = 0;
+    var i: usize = 0;
+
+    // Process 48 nucleotides at a time (16 complete codons) using SIMD encoding
+    while (i + 48 <= seq.len and aa_idx + 16 <= out.len) {
+        // Encode 48 nucleotides in 3 SIMD passes of 16
+        const enc0 = encodeNt4x16(seq[i..][0..16].*);
+        const enc1 = encodeNt4x16(seq[i + 16 ..][0..16].*);
+        const enc2 = encodeNt4x16(seq[i + 32 ..][0..16].*);
+
+        // Store encoded values for codon assembly
+        var encoded: [48]u8 = undefined;
+        inline for (0..16) |k| {
+            encoded[k] = enc0[k];
+        }
+        inline for (0..16) |k| {
+            encoded[16 + k] = enc1[k];
+        }
+        inline for (0..16) |k| {
+            encoded[32 + k] = enc2[k];
+        }
+
+        // Assemble 16 codons and translate
+        for (0..16) |j| {
+            const a = encoded[j * 3];
+            const b = encoded[j * 3 + 1];
+            const c = encoded[j * 3 + 2];
+            if (a > 3 or b > 3 or c > 3) {
+                out[aa_idx] = 'X'; // invalid nucleotide
+            } else {
+                out[aa_idx] = code.code[codonIndex(a, b, c)];
+            }
+            aa_idx += 1;
+        }
+        i += 48;
+    }
+
+    // Scalar fallback for remaining codons
+    while (i + 3 <= seq.len and aa_idx < out.len) {
+        const aa = dna2aa(code, seq[i..][0..3]);
+        out[aa_idx] = aa orelse 'X';
+        aa_idx += 1;
+        i += 3;
+    }
+
+    return aa_idx;
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -242,4 +326,103 @@ test "lowercase sequences work" {
     const code = findGeneticCode(1) orelse unreachable;
     const seq: [3]u8 = "atg".*;
     try std.testing.expectEqual(@as(u8, 'M'), dna2aa(code, &seq).?);
+}
+
+test "encodeNt4x16 encodes uppercase nucleotides" {
+    const input: [16]u8 = "ACGTACGTACGTACGT".*;
+    const result = encodeNt4x16(input);
+    const expected = [16]u8{ 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3 };
+    for (0..16) |i| {
+        try std.testing.expectEqual(expected[i], result[i]);
+    }
+}
+
+test "encodeNt4x16 encodes lowercase nucleotides" {
+    const input: [16]u8 = "acgtacgtacgtacgt".*;
+    const result = encodeNt4x16(input);
+    const expected = [16]u8{ 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3 };
+    for (0..16) |i| {
+        try std.testing.expectEqual(expected[i], result[i]);
+    }
+}
+
+test "encodeNt4x16 marks invalid bases as 4" {
+    const input: [16]u8 = "ACNXACGTACGT1234".*;
+    const result = encodeNt4x16(input);
+    // N=4, X=4, 1=4, 2=4, 3=4, 4=4
+    try std.testing.expectEqual(@as(u8, 0), result[0]); // A
+    try std.testing.expectEqual(@as(u8, 1), result[1]); // C
+    try std.testing.expectEqual(@as(u8, 4), result[2]); // N
+    try std.testing.expectEqual(@as(u8, 4), result[3]); // X
+    try std.testing.expectEqual(@as(u8, 4), result[12]); // 1
+    try std.testing.expectEqual(@as(u8, 4), result[13]); // 2
+}
+
+test "encodeNt4x16 matches scalar nt4 for all valid bases" {
+    const bases = "AaCcGgTtNn.@ACGT";
+    const input: [16]u8 = bases[0..16].*;
+    const result = encodeNt4x16(input);
+    for (0..16) |i| {
+        try std.testing.expectEqual(nt4[bases[i]], result[i]);
+    }
+}
+
+test "batchTranslate matches scalar dna2aa" {
+    const code = findGeneticCode(1) orelse unreachable;
+    // 54 bases = 18 codons (16 via SIMD + 2 scalar fallback)
+    const seq = "ATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATG";
+    var out: [20]u8 = undefined;
+    const n = batchTranslate(code, seq, &out);
+    try std.testing.expectEqual(@as(usize, 18), n);
+
+    // Verify each codon matches scalar translation
+    var i: usize = 0;
+    while (i + 3 <= seq.len) : (i += 3) {
+        const expected = dna2aa(code, seq[i..][0..3]) orelse 'X';
+        try std.testing.expectEqual(expected, out[i / 3]);
+    }
+}
+
+test "batchTranslate with mixed case and invalid bases" {
+    const code = findGeneticCode(1) orelse unreachable;
+    // 48 bases = 16 codons (all via SIMD), includes lowercase
+    const seq = "atgATGatgATGatgATGatgATGatgATGatgATGatgATGatgATGNNN";
+    var out: [20]u8 = undefined;
+    const n = batchTranslate(code, seq, &out);
+    // 51 bases => 17 codons
+    try std.testing.expectEqual(@as(usize, 17), n);
+    // First 16 should be M (ATG -> Met)
+    for (0..16) |i| {
+        try std.testing.expectEqual(@as(u8, 'M'), out[i]);
+    }
+    // Last one has NNN -> invalid -> 'X'
+    try std.testing.expectEqual(@as(u8, 'X'), out[16]);
+}
+
+test "batchTranslate with all 64 codons" {
+    const code = findGeneticCode(1) orelse unreachable;
+    const bases = "ACGT";
+    // Generate all 64 codons = 192 bases
+    var seq: [192]u8 = undefined;
+    var idx: usize = 0;
+    for (0..4) |a| {
+        for (0..4) |b| {
+            for (0..4) |c| {
+                seq[idx] = bases[a];
+                seq[idx + 1] = bases[b];
+                seq[idx + 2] = bases[c];
+                idx += 3;
+            }
+        }
+    }
+
+    var out: [64]u8 = undefined;
+    const n = batchTranslate(code, &seq, &out);
+    try std.testing.expectEqual(@as(usize, 64), n);
+
+    // Verify against scalar
+    for (0..64) |i| {
+        const expected = dna2aa(code, seq[i * 3 ..][0..3]) orelse 'X';
+        try std.testing.expectEqual(expected, out[i]);
+    }
 }

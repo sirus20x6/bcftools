@@ -459,6 +459,217 @@ fn benchGffParsing(allocator: std.mem.Allocator) !void {
 }
 
 // ---------------------------------------------------------------------------
+// 7. SIMD Nucleotide Encoding (encodeNt4x16)
+// ---------------------------------------------------------------------------
+
+fn benchSimdEncoding() void {
+    print("\n[7] SIMD Nucleotide Encoding (encodeNt4x16 vs scalar nt4)\n", .{});
+
+    // Generate a random DNA sequence
+    var rng = makeRng();
+    const bases = "ACGTacgt";
+    var seq: [1024]u8 = undefined;
+    for (&seq) |*b| b.* = bases[rng.random().uintLessThan(usize, 8)];
+
+    const iterations: usize = 1_000_000;
+
+    // Benchmark scalar nt4 lookup
+    var sink: u32 = 0;
+    const start_scalar = nanoTimestamp();
+    for (0..iterations) |_| {
+        for (seq) |b| {
+            sink +%= translate.nt4[b];
+        }
+    }
+    const end_scalar = nanoTimestamp();
+    printResult("scalar nt4 (1024 bases)", iterations, elapsed_ms(start_scalar, end_scalar));
+
+    // Benchmark SIMD encodeNt4x16
+    const start_simd = nanoTimestamp();
+    for (0..iterations) |_| {
+        var i: usize = 0;
+        while (i + 16 <= seq.len) : (i += 16) {
+            const result = translate.encodeNt4x16(seq[i..][0..16].*);
+            sink +%= @reduce(.Add, result);
+        }
+    }
+    const end_simd = nanoTimestamp();
+    printResult("SIMD encodeNt4x16 (1024 bases)", iterations, elapsed_ms(start_simd, end_simd));
+
+    if (sink == 0xFFFFFFFF) print("", .{});
+}
+
+// ---------------------------------------------------------------------------
+// 8. SIMD Batch Translation (batchTranslate vs scalar dna2aa)
+// ---------------------------------------------------------------------------
+
+fn benchBatchTranslate() void {
+    print("\n[8] Batch Translation (batchTranslate vs scalar dna2aa)\n", .{});
+
+    const code = translate.findGeneticCode(1) orelse {
+        print("  ERROR: genetic code table 1 not found\n", .{});
+        return;
+    };
+
+    var rng = makeRng();
+    const bases = "ACGT";
+    // 960 bases = 320 codons (divisible by 48 for clean SIMD path)
+    var seq: [960]u8 = undefined;
+    for (&seq) |*b| b.* = bases[rng.random().uintLessThan(usize, 4)];
+
+    var out: [320]u8 = undefined;
+    const iterations: usize = 100_000;
+
+    // Benchmark scalar translation
+    var sink: u32 = 0;
+    const start_scalar = nanoTimestamp();
+    for (0..iterations) |_| {
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i + 3 <= seq.len) : (i += 3) {
+            out[j] = translate.dna2aa(code, seq[i..][0..3]) orelse 'X';
+            j += 1;
+        }
+        sink +%= out[0];
+    }
+    const end_scalar = nanoTimestamp();
+    printResult("scalar dna2aa (960 bases)", iterations, elapsed_ms(start_scalar, end_scalar));
+
+    // Benchmark SIMD batch translation
+    const start_simd = nanoTimestamp();
+    for (0..iterations) |_| {
+        _ = translate.batchTranslate(code, &seq, &out);
+        sink +%= out[0];
+    }
+    const end_simd = nanoTimestamp();
+    printResult("SIMD batchTranslate (960 bases)", iterations, elapsed_ms(start_simd, end_simd));
+
+    if (sink == 0xFFFFFFFF) print("", .{});
+}
+
+// ---------------------------------------------------------------------------
+// 9. SIMD Protein Comparison (simdFirstMismatch)
+// ---------------------------------------------------------------------------
+
+fn benchProteinComparison() void {
+    print("\n[9] Protein Comparison (SIMD simdFirstMismatch vs scalar)\n", .{});
+
+    var rng = makeRng();
+    const aas = "ACDEFGHIKLMNPQRSTVWY*";
+
+    // Generate a 500-AA protein pair that differs at position 450
+    var prot_a: [500]u8 = undefined;
+    var prot_b: [500]u8 = undefined;
+    for (0..500) |i| {
+        prot_a[i] = aas[rng.random().uintLessThan(usize, aas.len)];
+        prot_b[i] = prot_a[i];
+    }
+    // Introduce a mismatch near the end
+    prot_b[450] = if (prot_a[450] == 'X') 'Y' else 'X';
+
+    const iterations: usize = 5_000_000;
+
+    // Benchmark scalar comparison
+    var sink: usize = 0;
+    const start_scalar = nanoTimestamp();
+    for (0..iterations) |iter| {
+        // Vary the mismatch position to defeat branch prediction
+        prot_b[450] = prot_a[450]; // restore
+        const mismatch_pos = 400 + (iter % 100);
+        const saved = prot_b[mismatch_pos];
+        prot_b[mismatch_pos] = if (prot_a[mismatch_pos] == 'X') 'Y' else 'X';
+        for (0..500) |i| {
+            if (prot_a[i] != prot_b[i]) {
+                sink +%= i;
+                break;
+            }
+        }
+        prot_b[mismatch_pos] = saved;
+    }
+    const end_scalar = nanoTimestamp();
+    printResult("scalar first-mismatch (500 AA)", iterations, elapsed_ms(start_scalar, end_scalar));
+
+    // Benchmark SIMD comparison
+    const start_simd = nanoTimestamp();
+    for (0..iterations) |iter| {
+        prot_b[450] = prot_a[450]; // restore
+        const mismatch_pos = 400 + (iter % 100);
+        const saved = prot_b[mismatch_pos];
+        prot_b[mismatch_pos] = if (prot_a[mismatch_pos] == 'X') 'Y' else 'X';
+        if (haplotype.simdFirstMismatch(&prot_a, &prot_b)) |pos| {
+            sink +%= pos;
+        }
+        prot_b[mismatch_pos] = saved;
+    }
+    const end_simd = nanoTimestamp();
+    printResult("SIMD simdFirstMismatch (500 AA)", iterations, elapsed_ms(start_simd, end_simd));
+
+    if (sink == 0xFFFFFFFF) print("", .{});
+}
+
+// ---------------------------------------------------------------------------
+// 10. SIMD Uppercase Conversion
+// ---------------------------------------------------------------------------
+
+fn benchUppercase() void {
+    print("\n[10] Uppercase Conversion (SIMD vs scalar)\n", .{});
+
+    var rng = makeRng();
+    const iterations: usize = 1_000_000;
+
+    // Generate a mixed-case sequence of 1024 bytes
+    var seq_template: [1024]u8 = undefined;
+    for (&seq_template) |*b| {
+        const base: u8 = @intCast('a' + rng.random().uintLessThan(u8, 26));
+        // 50% lowercase, 50% uppercase
+        b.* = if (rng.random().uintLessThan(u32, 2) == 0) base else base - 32;
+    }
+
+    // Benchmark scalar uppercase
+    var seq_buf: [1024]u8 = undefined;
+    var sink: u32 = 0;
+    const start_scalar = nanoTimestamp();
+    for (0..iterations) |_| {
+        @memcpy(&seq_buf, &seq_template);
+        for (&seq_buf) |*c| {
+            if (c.* >= 'a' and c.* <= 'z') c.* -= 32;
+        }
+        sink +%= seq_buf[0];
+    }
+    const end_scalar = nanoTimestamp();
+    printResult("scalar uppercase (1024 bytes)", iterations, elapsed_ms(start_scalar, end_scalar));
+
+    // Benchmark SIMD uppercase (using the CsqContext.uppercaseInPlace is private,
+    // so we replicate the SIMD logic here for benchmarking)
+    const start_simd = nanoTimestamp();
+    for (0..iterations) |_| {
+        @memcpy(&seq_buf, &seq_template);
+        var i: usize = 0;
+        while (i + 16 <= seq_buf.len) {
+            var chunk: @Vector(16, u8) = seq_buf[i..][0..16].*;
+            const lower_a: @Vector(16, u8) = @splat('a');
+            const lower_z: @Vector(16, u8) = @splat('z');
+            const ge_a: @Vector(16, bool) = chunk >= lower_a;
+            const le_z: @Vector(16, bool) = chunk <= lower_z;
+            const is_lower = @select(bool, ge_a, le_z, @as(@Vector(16, bool), @splat(false)));
+            const adjustment = @select(u8, is_lower, @as(@Vector(16, u8), @splat(32)), @as(@Vector(16, u8), @splat(0)));
+            chunk -= adjustment;
+            seq_buf[i..][0..16].* = chunk;
+            i += 16;
+        }
+        while (i < seq_buf.len) {
+            if (seq_buf[i] >= 'a' and seq_buf[i] <= 'z') seq_buf[i] -= 32;
+            i += 1;
+        }
+        sink +%= seq_buf[0];
+    }
+    const end_simd = nanoTimestamp();
+    printResult("SIMD uppercase (1024 bytes)", iterations, elapsed_ms(start_simd, end_simd));
+
+    if (sink == 0xFFFFFFFF) print("", .{});
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -476,6 +687,10 @@ pub fn main() !void {
     try benchFormatting(allocator);
     try benchVbufPush(allocator);
     try benchGffParsing(allocator);
+    benchSimdEncoding();
+    benchBatchTranslate();
+    benchProteinComparison();
+    benchUppercase();
 
     print("\nDone.\n", .{});
 }
