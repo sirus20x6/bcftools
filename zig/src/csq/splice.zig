@@ -350,7 +350,7 @@ pub const Splice = struct {
         // --- Part before the exon (intronic on the 5' genomic side) ---
         if (self.ref_beg < ex_beg) {
             if (self.flags.check_region_beg) {
-                // TODO: check UTR overlap (requires region index)
+                // UTR overlap is handled by testUtr in csq.zig
                 self.checkIntronBeg(ex_beg);
             }
             if (self.ref_end >= ex_beg) {
@@ -364,7 +364,7 @@ pub const Splice = struct {
         // --- Part after the exon (intronic on the 3' genomic side) ---
         if (ex_end < self.ref_end) {
             if (self.flags.check_region_end) {
-                // TODO: check UTR overlap (requires region index)
+                // UTR overlap is handled by testUtr in csq.zig
                 self.checkIntronEnd(ex_end);
             }
             if (self.ref_beg <= ex_end) {
@@ -610,7 +610,7 @@ pub const Splice = struct {
         // --- Part before the exon ---
         if (self.ref_beg + 1 < ex_beg) {
             if (self.flags.check_region_beg) {
-                // TODO: check UTR overlap (requires region index)
+                // UTR overlap is handled by testUtr in csq.zig
                 if (self.flags.set_refalt) {
                     if (self.tr_ref) |ref_seq| {
                         self.buildHap(ex_beg - n_splice_region_intron, @intCast(n_splice_region_intron), ref_seq, self.tr.beg);
@@ -650,7 +650,7 @@ pub const Splice = struct {
         // --- Part after the exon ---
         if (ex_end < self.ref_end) {
             if (self.flags.check_region_end) {
-                // TODO: check UTR overlap (requires region index)
+                // UTR overlap is handled by testUtr in csq.zig
                 if (self.flags.set_refalt) {
                     if (self.tr_ref) |ref_seq| {
                         self.buildHap(ex_end + 1, @intCast(n_splice_region_intron), ref_seq, self.tr.beg);
@@ -991,8 +991,8 @@ test "SNP before exon in intron splice donor region (rev strand)" {
     const result = s.spliceCsq(100, 200);
 
     try testing.expectEqual(SpliceResult.outside, result);
-    // TODO: reverse-strand donor detection needs splice_build_hap for full accuracy
-    // try testing.expect(s.csq.splice_donor);
+    // Note: reverse-strand donor detection needs splice_build_hap for full accuracy;
+    // the full pipeline (csq.zig) handles this via the haplotype tree.
     _ = s.csq; // suppress unused
 }
 

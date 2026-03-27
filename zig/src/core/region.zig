@@ -21,7 +21,8 @@ pub fn RegionIndex(comptime Payload: type) type {
                 while (self.idx < self.intervals.len) {
                     const iv = &self.intervals[self.idx];
                     self.idx += 1;
-                    if (iv.beg > self.query_end) return null; // past query, done
+                    // intervals sorted by beg: once beg > query_end, no more can overlap
+                    if (iv.beg > self.query_end) return null;
                     if (iv.end >= self.query_beg) return iv; // overlaps
                 }
                 return null;
@@ -30,8 +31,7 @@ pub fn RegionIndex(comptime Payload: type) type {
             pub fn reset(self: *OverlapIterator, beg: u32, end: u32) void {
                 self.query_beg = beg;
                 self.query_end = end;
-                // binary search for first interval that could overlap
-                self.idx = lowerBound(self.intervals, beg);
+                self.idx = 0;
             }
         };
 
@@ -83,12 +83,13 @@ pub fn RegionIndex(comptime Payload: type) type {
         pub fn overlap(self: *Self, seq: []const u8, beg: u32, end: u32) OverlapIterator {
             if (!self.sorted) self.sort();
             const intervals = if (self.sequences.get(seq)) |list| list.items else &[_]Interval{};
-            // Start from 0 because intervals sorted by beg don't have monotonic
-            // end values — a binary search on end can miss earlier intervals whose
-            // beg is small but end extends past the query start.  The iterator's
-            // beg > query_end check still provides an early exit.
+            // Binary search: find the first interval where beg > query_end.
+            // All intervals at or beyond that index have beg > end and cannot
+            // overlap, so we trim the slice.  The iterator still checks
+            // end >= query_beg for each entry (since end values are not monotonic).
+            const hi = upperBound(intervals, end);
             return .{
-                .intervals = intervals,
+                .intervals = intervals[0..hi],
                 .idx = 0,
                 .query_beg = beg,
                 .query_end = end,
@@ -99,20 +100,21 @@ pub fn RegionIndex(comptime Payload: type) type {
             return self.sequences.contains(seq);
         }
 
-        fn lowerBound(intervals: []const Interval, target_beg: u32) usize {
-            // Find first interval whose end >= target_beg
-            // (all intervals before this point end before our query begins)
+        /// Find the first index where interval.beg > target.
+        /// All intervals before this index have beg <= target, so they
+        /// *could* overlap a query ending at `target`.
+        fn upperBound(intervals: []const Interval, target: u32) usize {
             var lo: usize = 0;
             var hi: usize = intervals.len;
             while (lo < hi) {
                 const mid = lo + (hi - lo) / 2;
-                if (intervals[mid].end < target_beg) {
-                    lo = mid + 1;
-                } else {
+                if (intervals[mid].beg > target) {
                     hi = mid;
+                } else {
+                    lo = mid + 1;
                 }
             }
-            return lo;
+            return lo; // first index where beg > target
         }
     };
 }

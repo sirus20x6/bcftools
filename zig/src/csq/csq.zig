@@ -893,9 +893,7 @@ pub const CsqContext = struct {
 
     /// Get or create the Tscript auxiliary data for a transcript.
     fn getOrCreateTscript(self: *CsqContext, tr: *Transcript) !*Tscript {
-        if (tr.aux) |aux| {
-            return @as(*Tscript, @ptrCast(@alignCast(aux)));
-        }
+        if (self.getTscript(tr)) |taux| return taux;
         const tscript = try self.allocator.create(Tscript);
         tscript.* = .{};
         tr.aux = tscript;
@@ -1171,11 +1169,11 @@ pub const CsqContext = struct {
             // Point the haplotype context at this transcript
             self.hap_ctx.tr = tr;
 
-            const taux: *Tscript = @ptrCast(@alignCast(tr.aux orelse {
+            const taux: *Tscript = self.getTscript(tr) orelse {
                 // No aux data -- nothing to finalize, just mark for removal
                 try self.rm_transcripts.append(self.allocator, tr);
                 continue;
-            }));
+            };
 
             const root = taux.root orelse {
                 try self.rm_transcripts.append(self.allocator, tr);
@@ -1480,7 +1478,13 @@ pub const CsqContext = struct {
         if (self.prev_rid != rec.rid) {
             self.prev_rid = rec.rid;
             self.prev_pos = @intCast(rec.pos);
-            // TODO: validate chromosome exists in fasta and GFF
+            // Warn if the chromosome is not found in the GFF annotation
+            if (self.gff) |g| {
+                if (!g.hasSeq(rec.chr)) {
+                    if (self.verbosity > 0)
+                        std.log.warn("Chromosome '{s}' not found in GFF annotation — variants on this contig will have no consequences", .{rec.chr});
+                }
+            }
         }
 
         // Check if this record has callable alt alleles
@@ -1621,11 +1625,13 @@ pub const CsqContext = struct {
                     else => return err,
                 };
                 // Build the spliced reference from CDS segments
-                self.tscriptSpliceRef(tr) catch {};
+                self.tscriptSpliceRef(tr) catch |err| {
+                    if (self.verbosity > 1) std.log.warn("tscriptSpliceRef failed for transcript {d}: {}", .{ tr.id, err });
+                };
                 try self.active_transcripts.add(tr);
             }
 
-            const taux_ptr: *Tscript = @ptrCast(@alignCast(tr.aux orelse continue));
+            const taux_ptr: *Tscript = self.getTscript(tr) orelse continue;
             // Verify VCF REF allele matches the FASTA reference
             self.sanityCheckRef(tr, rec) catch |err| switch (err) {
                 error.RefMismatchSkipped => continue,
@@ -1700,7 +1706,9 @@ pub const CsqContext = struct {
                             .gene = if (tr.gene) |g| @as(?[]const u8, if (g.name) |n| std.mem.span(n) else null) else null,
                         },
                     };
-                    _ = self.csqStage(&splice_csq, rec) catch {};
+                    _ = self.csqStage(&splice_csq, rec) catch |err| {
+                        if (self.verbosity > 1) std.log.warn("csqStage (splice, drop_gt) failed: {}", .{err});
+                    };
                 }
 
                 // Splice-only (HAP_SSS): stage the splice consequence directly
@@ -1877,7 +1885,9 @@ pub const CsqContext = struct {
                                 .gene = if (tr.gene) |g| @as(?[]const u8, if (g.name) |n| std.mem.span(n) else null) else null,
                             },
                         };
-                        _ = self.csqStage(&splice_csq_entry, rec) catch {};
+                        _ = self.csqStage(&splice_csq_entry, rec) catch |err| {
+                            if (self.verbosity > 1) std.log.warn("csqStage (splice, genotype) failed: {}", .{err});
+                        };
                     }
 
                     // Splice-only (HAP_SSS): stage the splice consequence directly
@@ -1968,11 +1978,13 @@ pub const CsqContext = struct {
                     },
                     else => return err,
                 };
-                self.tscriptSpliceRef(tr) catch {};
+                self.tscriptSpliceRef(tr) catch |err| {
+                    if (self.verbosity > 1) std.log.warn("tscriptSpliceRef failed for transcript {d}: {}", .{ tr.id, err });
+                };
                 try self.active_transcripts.add(tr);
             }
 
-            const taux: *Tscript = @ptrCast(@alignCast(tr.aux orelse continue));
+            const taux: *Tscript = self.getTscript(tr) orelse continue;
             // Verify VCF REF allele matches the FASTA reference
             self.sanityCheckRef(tr, rec) catch |err| switch (err) {
                 error.RefMismatchSkipped => continue,

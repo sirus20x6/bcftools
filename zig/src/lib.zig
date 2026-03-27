@@ -19,7 +19,7 @@ pub const vcf_htslib = @import("vcf/htslib.zig");
 // Version
 pub const version = "0.1.0";
 
-// C-compatible API (Phase 8 - stubs for now)
+// C-compatible API (stubs — not yet implemented)
 
 /// Initialize a CSQ context for consequence calling.
 /// Returns null on failure.
@@ -29,7 +29,7 @@ export fn bcftools_csq_init(
 ) ?*anyopaque {
     _ = _gff_path;
     _ = _fasta_path;
-    // TODO: Implement in Phase 7
+    // Not yet implemented
     return null;
 }
 
@@ -41,20 +41,20 @@ export fn bcftools_csq_process(
 ) c_int {
     _ = _ctx;
     _ = _rec;
-    // TODO: Implement in Phase 7
+    // Not yet implemented
     return -1;
 }
 
 /// Flush remaining buffered records.
 export fn bcftools_csq_flush(_ctx: ?*anyopaque) void {
     _ = _ctx;
-    // TODO: Implement in Phase 7
+    // Not yet implemented
 }
 
 /// Destroy a CSQ context and free all resources.
 export fn bcftools_csq_destroy(_ctx: ?*anyopaque) void {
     _ = _ctx;
-    // TODO: Implement in Phase 7
+    // Not yet implemented
 }
 
 // Pull in tests from all modules

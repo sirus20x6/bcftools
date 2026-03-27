@@ -22,6 +22,12 @@ const Csq = types.Csq;
 const Vcsq = types.Vcsq;
 const n_ref_pad = types.n_ref_pad;
 
+/// Extract the Tscript auxiliary data from a Transcript's opaque `aux` pointer.
+/// Returns null if aux is not set.
+fn getTscriptAux(tr: *const gff_types.Transcript) ?*types.Tscript {
+    return @ptrCast(@alignCast(tr.aux orelse return null));
+}
+
 // ---------------------------------------------------------------------------
 // HapInitResult — return value from hapInit
 // ---------------------------------------------------------------------------
@@ -808,12 +814,12 @@ pub fn hapFinalize(ctx: *HapContext) !void {
     // We need the Tscript (aux data) which holds the ref/sref and root.
     // By convention, the transcript's .aux field points to the Tscript.
     const tr_ptr: *const gff_types.Transcript = @ptrCast(@alignCast(tr_opaque));
-    const tscript_aux: *types.Tscript = @ptrCast(@alignCast(tr_ptr.aux orelse return));
+    const tscript_aux: *types.Tscript = getTscriptAux(tr_ptr) orelse return;
     const allocator = ctx.allocator;
 
     // Build spliced reference if not done yet
     if (tscript_aux.sref == null)
-        try tscriptSpliceRef(tscript_aux, tr_ptr);
+        try tscriptSpliceRef(allocator, tscript_aux, tr_ptr);
 
     const sref = tscript_aux.sref orelse return;
     const sref_len: usize = @intCast(tscript_aux.nsref);
@@ -1268,9 +1274,8 @@ pub fn hapFinalize(ctx: *HapContext) !void {
 
 /// Build the spliced reference for a transcript by concatenating CDS exons.
 /// Corresponds to C function tscript_splice_ref().
-fn tscriptSpliceRef(tscript_aux: *types.Tscript, tr: *const gff_types.Transcript) !void {
+fn tscriptSpliceRef(allocator: std.mem.Allocator, tscript_aux: *types.Tscript, tr: *const gff_types.Transcript) !void {
     const ref_seq = tscript_aux.ref_seq orelse return error.InvalidStrand;
-    const allocator = std.heap.page_allocator; // TODO: pass allocator properly
 
     var total_len: usize = 0;
     for (tr.cds.items) |cds| total_len += cds.len;
@@ -1408,21 +1413,13 @@ fn buildVstr(
 }
 
 // ---------------------------------------------------------------------------
-// hapFlush — flush completed transcripts (skeleton)
+// hapFlush — flush completed transcripts
 // ---------------------------------------------------------------------------
-
-/// Flush completed transcripts from the active-transcript heap.
-///
-/// TODO:
-///   - Pop transcripts whose end <= pos from the heap
-///   - Call hapFinalize for each
-///   - Stage consequences for VCF or text output
-///   - Mark transcripts for deferred deletion
-pub fn hapFlush(ctx: *HapContext, pos: u32) !void {
-    _ = ctx;
-    _ = pos;
-    // TODO: implement heap-based flushing
-}
+// Note: transcript flushing is implemented in CsqContext.flushTranscripts()
+// (csq.zig) which owns the active-transcript priority queue and calls
+// hapFinalize for each completed transcript.  This stub is retained for
+// reference but is not called by the pipeline.
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -1929,6 +1926,7 @@ test "hapFinalize produces consequence for simple 2-node tree" {
         .ref_seq = &ref_buf,
         .root = &root,
     };
+    defer if (tscript_data.sref) |s| allocator.free(s);
     tr.aux = @ptrCast(&tscript_data);
 
     var cds_entry = gff_types.CdsEntry{
@@ -1994,6 +1992,7 @@ test "hapFinalize merges compound variants in same codon" {
         .ref_seq = &ref_buf,
         .root = &root,
     };
+    defer if (tscript_data.sref) |s| allocator.free(s);
     tr.aux = @ptrCast(&tscript_data);
 
     var cds_entry = gff_types.CdsEntry{
