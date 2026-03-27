@@ -617,10 +617,23 @@ pub const GffParser = struct {
     // -----------------------------------------------------------------------
 
     fn finalizeTscripts(self: *GffParser, arena_alloc: std.mem.Allocator) !void {
-        _ = arena_alloc;
-        var it = self.transcripts.iterator();
-        while (it.next()) |entry| {
-            const tr = entry.value_ptr.*;
+        // Collect and sort transcripts by id (= GFF file order) to ensure
+        // deterministic CDS insertion order matching C's regidx behavior.
+        var sorted_trs: std.ArrayList(*Transcript) = .empty;
+        defer sorted_trs.deinit(arena_alloc);
+        {
+            var it = self.transcripts.iterator();
+            while (it.next()) |entry| {
+                try sorted_trs.append(arena_alloc, entry.value_ptr.*);
+            }
+        }
+        std.mem.sort(*Transcript, sorted_trs.items, {}, struct {
+            fn lessThan(_: void, a: *Transcript, b: *Transcript) bool {
+                return a.id < b.id;
+            }
+        }.lessThan);
+
+        for (sorted_trs.items) |tr| {
             const chr = self.seqName(tr);
 
             // Register transcript in idx_tscript

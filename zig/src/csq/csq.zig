@@ -1055,18 +1055,11 @@ pub const CsqContext = struct {
     ///   3: Non-compound (UTR, intron, non_coding, etc.)
     /// This matches the C code's output ordering.
     fn vcsqCmpLessThan(_: void, a: Vcsq, b: Vcsq) bool {
-        return vcsqSortKey(a) < vcsqSortKey(b);
-    }
-
-    fn vcsqSortKey(v: Vcsq) u3 {
-        // Match C's output order: non-CDS consequences first (pushed during
-        // process by testUtr/testSplice/testTscript), then CDS consequences
-        // (appended later by hapFlush/transferTreeCsqToVbuf).
-        // Preserve insertion order — don't sort. Return 0 for all entries
-        // so the stable sort maintains the original push order.
+        // Preserve insertion order — return false for all pairs.
         // The C code outputs consequences in csq_push insertion order.
-        _ = v;
-        return 0;
+        _ = a;
+        _ = b;
+        return false;
     }
 
     /// Flush all buffered VCF records whose keep_until <= pos.
