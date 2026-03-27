@@ -9,6 +9,8 @@ const CsqContext = csq_mod.CsqContext;
 const GffParser = gff_mod.GffParser;
 const Phase = csq_mod.Phase;
 const Filter = lib.filter.Filter;
+const StatsContext = lib.stats.StatsContext;
+const NormContext = lib.norm.NormContext;
 
 /// Adapter function: bridges CsqContext.FetchSeqFn to HtsFaidx.fetchSeq
 fn htsFaidxFetchAdapter(ctx: *anyopaque, allocator: std.mem.Allocator, chr: [*:0]const u8, beg: i64, end: i64) ?[]u8 {
@@ -22,6 +24,7 @@ const usage_text =
     \\
     \\Commands:
     \\  csq        Haplotype-aware consequence caller
+    \\  stats      Produce VCF/BCF file stats
     \\
     \\Options:
     \\  --help     Show this help message
@@ -844,6 +847,138 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
 }
 
 // -------------------------------------------------------------------------
+// Stats subcommand
+// -------------------------------------------------------------------------
+
+const stats_usage_text =
+    \\
+    \\About: Produce VCF/BCF file stats that can be plotted with plot-vcfstats.
+    \\Usage: bcftools-zig stats [OPTIONS] input.vcf
+    \\
+    \\Options:
+    \\  -o, --output FILE     Write output to FILE [standard output]
+    \\  -s, --samples LIST    Restrict to comma-separated list of samples
+    \\      --help            Show this help message
+    \\
+;
+
+const StatsOptions = struct {
+    input_fname: ?[]const u8 = null,
+    output_fname: ?[]const u8 = null,
+    samples_list: ?[]const u8 = null,
+    show_help: bool = false,
+};
+
+const StatsArgError = error{
+    MissingArgValue,
+    UnknownOption,
+};
+
+fn parseStatsArgs(args_iter: *std.process.ArgIterator) StatsArgError!StatsOptions {
+    var opts = StatsOptions{};
+    while (args_iter.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            opts.output_fname = args_iter.next() orelse return error.MissingArgValue;
+        } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--samples")) {
+            opts.samples_list = args_iter.next() orelse return error.MissingArgValue;
+        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            opts.show_help = true;
+        } else if (arg.len > 0 and arg[0] == '-') {
+            _ = args_iter.next(); // consume value of unknown option
+        } else {
+            opts.input_fname = arg;
+        }
+    }
+    return opts;
+}
+
+fn runStats(args_iter: *std.process.ArgIterator) !void {
+    const opts = parseStatsArgs(args_iter) catch |err| {
+        const msg = switch (err) {
+            error.MissingArgValue => "Error: missing value for option\n",
+            error.UnknownOption => "Error: unknown option\n",
+        };
+        stderr_file.writeAll(msg) catch {};
+        stderr_file.writeAll(stats_usage_text) catch {};
+        std.process.exit(1);
+    };
+
+    if (opts.show_help) {
+        stdout_file.writeAll(stats_usage_text) catch {};
+        return;
+    }
+
+    if (opts.input_fname == null) {
+        stderr_file.writeAll("Error: no input VCF file specified\n") catch {};
+        stderr_file.writeAll(stats_usage_text) catch {};
+        std.process.exit(1);
+    }
+
+    const allocator = std.heap.page_allocator;
+
+    // Open VCF input
+    var reader = VcfReader.open(allocator, opts.input_fname.?) catch |err| {
+        std.debug.print("Error: failed to open VCF file '{s}': {}\n", .{ opts.input_fname.?, err });
+        std.process.exit(1);
+    };
+    defer reader.deinit();
+
+    const n_samples: u32 = @intCast(reader.nSamples());
+
+    // Build sample name slice for the stats context
+    var stats_sample_names: []const []const u8 = &.{};
+    if (n_samples > 0) {
+        stats_sample_names = reader.sample_names.items;
+    }
+
+    // Initialize stats context
+    var stats_ctx = StatsContext.init(allocator, n_samples, stats_sample_names) catch |err| {
+        std.debug.print("Error: failed to initialize stats context: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer stats_ctx.deinit();
+
+    // Main processing loop
+    var rec = VcfRecord.init(allocator);
+    defer rec.deinit();
+
+    while (true) {
+        const has_record = reader.next(&rec) catch |err| {
+            std.debug.print("Warning: failed to parse VCF record: {}\n", .{err});
+            continue;
+        };
+        if (!has_record) break;
+
+        // Pass the raw storage line for sample genotype parsing
+        stats_ctx.addRecord(&rec, rec._storage);
+    }
+
+    // Write output
+    if (opts.output_fname) |fname| {
+        const out = std.fs.cwd().createFile(fname, .{}) catch |err| {
+            std.debug.print("Error: failed to open output file '{s}': {}\n", .{ fname, err });
+            std.process.exit(1);
+        };
+        defer out.close();
+        var wbuf: [8192]u8 = undefined;
+        var bw = out.writer(&wbuf);
+        stats_ctx.writeReport(&bw.interface) catch |err| {
+            std.debug.print("Error: failed to write stats report: {}\n", .{err});
+            std.process.exit(1);
+        };
+        bw.interface.flush() catch {};
+    } else {
+        var wbuf: [8192]u8 = undefined;
+        var bw = stdout_file.writer(&wbuf);
+        stats_ctx.writeReport(&bw.interface) catch |err| {
+            std.debug.print("Error: failed to write stats report: {}\n", .{err});
+            std.process.exit(1);
+        };
+        bw.interface.flush() catch {};
+    }
+}
+
+// -------------------------------------------------------------------------
 // Main entry point
 // -------------------------------------------------------------------------
 
@@ -875,7 +1010,113 @@ pub fn main() !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "stats")) {
+        try runStats(&args);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "norm")) {
+        try runNorm(&args);
+        return;
+    }
+
     std.debug.print("Unknown command: {s}\n", .{command});
     stderr_file.writeAll(usage_text) catch {};
     std.process.exit(1);
+}
+
+// -------------------------------------------------------------------------
+// norm subcommand
+// -------------------------------------------------------------------------
+
+fn runNorm(args: *std.process.ArgIterator) !void {
+    const allocator = std.heap.page_allocator;
+    const stderr_f = std.fs.File{ .handle = std.posix.STDERR_FILENO };
+    const stdout_f = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
+
+    var input_fname: ?[]const u8 = null;
+    var output_fname: ?[]const u8 = null;
+    var fasta_fname: ?[]const u8 = null;
+    var do_split = false;
+
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            stdout_f.writeAll(
+                \\
+                \\About: Left-align and normalize indels, split multi-allelic variants.
+                \\Usage: bcftools-zig norm [OPTIONS] input.vcf
+                \\
+                \\  -f, --fasta-ref FILE    Reference FASTA for left-alignment
+                \\  -m, --multiallelics -   Split multi-allelic into biallelic (-m-)
+                \\  -o, --output FILE       Output file [stdout]
+                \\  -O, --output-type v     Output type [v]
+                \\
+            ) catch {};
+            return;
+        } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--fasta-ref")) {
+            fasta_fname = args.next();
+        } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--multiallelics")) {
+            const val = args.next() orelse continue;
+            if (std.mem.eql(u8, val, "-")) do_split = true;
+        } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            output_fname = args.next();
+        } else if (std.mem.eql(u8, arg, "-O") or std.mem.eql(u8, arg, "--output-type")) {
+            _ = args.next(); // consume, only -O v supported
+        } else if (arg[0] != '-') {
+            input_fname = arg;
+        }
+    }
+
+    const in_fname = input_fname orelse {
+        stderr_f.writeAll("Error: no input VCF file specified\n") catch {};
+        std.process.exit(1);
+    };
+
+    var reader = VcfReader.open(allocator, in_fname) catch |err| {
+        std.debug.print("Error: failed to open '{s}': {}\n", .{ in_fname, err });
+        std.process.exit(1);
+    };
+    defer reader.deinit();
+
+    const out_file = if (output_fname) |fname|
+        std.fs.cwd().createFile(fname, .{}) catch {
+            std.debug.print("Error: failed to open output '{s}'\n", .{fname});
+            std.process.exit(1);
+        }
+    else
+        stdout_f;
+    defer if (output_fname != null) out_file.close();
+
+    // Write header
+    for (reader.header_lines.items) |line| {
+        out_file.writeAll(line) catch {};
+        out_file.writeAll("\n") catch {};
+    }
+
+    var ctx = NormContext.init(allocator, .{
+        .split_mode = if (do_split) .any else .none,
+    });
+    defer ctx.deinit();
+
+    var rec = VcfRecord.init(allocator);
+    defer rec.deinit();
+
+    while (true) {
+        const has = reader.next(&rec) catch continue;
+        if (!has) break;
+
+        const results = ctx.processRecord(&rec) catch {
+            // Write original on error
+            if (rec._storage) |s| { out_file.writeAll(s) catch {}; out_file.writeAll("\n") catch {}; }
+            continue;
+        };
+
+        for (results) |*r| {
+            // Write normalized record
+            if (r._storage) |s| {
+                out_file.writeAll(s) catch {};
+                out_file.writeAll("\n") catch {};
+            }
+        }
+    }
 }
