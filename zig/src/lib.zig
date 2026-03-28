@@ -10,6 +10,7 @@ pub const core_allocator = @import("core/allocator.zig");
 pub const core_buffer = @import("core/buffer.zig");
 pub const core_region = @import("core/region.zig");
 pub const core_hash = @import("core/hash.zig");
+pub const core_simd = @import("core/simd.zig");
 pub const csq_format = @import("csq/format.zig");
 pub const csq_pipeline = @import("csq/csq.zig");
 pub const vcf_record = @import("vcf/record.zig");
@@ -127,6 +128,7 @@ comptime {
     _ = haplotype;
     _ = core_buffer;
     _ = core_region;
+    _ = core_simd;
     _ = csq_format;
     _ = csq_pipeline;
     _ = vcf_record;

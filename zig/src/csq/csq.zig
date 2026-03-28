@@ -13,6 +13,7 @@ const splice_mod = @import("splice.zig");
 const gff_mod = @import("../gff/gff.zig");
 const gff_types = @import("../gff/types.zig");
 const region = @import("../core/region.zig");
+const simd = @import("../core/simd.zig");
 const types = @import("types.zig");
 const hts_c = @import("../vcf/htslib.zig").c;
 
@@ -238,30 +239,40 @@ pub const VcfRecord = struct {
         const line = self.raw_line orelse return null;
 
         // Find FORMAT column (index 8) and sample columns (index 9+)
-        var col: usize = 0;
-        var col_start: usize = 0;
+        // Use SIMD-accelerated tab finding to skip to fields quickly.
+        // We need to find 9 tabs (separating fields 0-8, then field 9+).
+        // After finding 8 tabs we're at the start of field 8 (FORMAT).
+        // After finding 9 tabs we're at the start of field 9 (first sample).
+        var tabs_found: usize = 0;
+        var remaining = line;
         var format_start: usize = 0;
         var format_end: usize = 0;
         var samples_start: usize = 0;
 
-        for (line, 0..) |c, idx| {
-            if (c == '\t') {
-                if (col == 8) {
-                    format_start = col_start;
-                    format_end = idx;
-                    samples_start = idx + 1;
+        while (tabs_found < 9) {
+            if (simd.findByte(remaining, '\t')) |tab_pos| {
+                tabs_found += 1;
+                if (tabs_found == 8) {
+                    // Just found the 8th tab — remaining[tab_pos+1..] is field 8 (FORMAT)
+                    format_start = @intFromPtr(remaining.ptr) - @intFromPtr(line.ptr) + tab_pos + 1;
+                } else if (tabs_found == 9) {
+                    // Just found the 9th tab — end of FORMAT, start of samples
+                    format_end = @intFromPtr(remaining.ptr) - @intFromPtr(line.ptr) + tab_pos;
+                    samples_start = format_end + 1;
                 }
-                col += 1;
-                col_start = idx + 1;
+                remaining = remaining[tab_pos + 1 ..];
+            } else {
+                // No more tabs
+                if (tabs_found == 8) {
+                    // FORMAT is the last field — no samples
+                    format_start = @intFromPtr(remaining.ptr) - @intFromPtr(line.ptr);
+                    format_end = line.len;
+                    return null;
+                }
+                break;
             }
         }
-        // Handle if FORMAT is the last column found
-        if (col == 8) {
-            format_start = col_start;
-            format_end = line.len;
-            return null; // No sample columns
-        }
-        if (col < 9) return null; // Not enough columns for FORMAT + samples
+        if (tabs_found < 9) return null; // Not enough columns for FORMAT + samples
 
         // Check that GT is the first FORMAT subfield
         const format_field = line[format_start..format_end];
@@ -273,30 +284,26 @@ pub const VcfRecord = struct {
             false;
         if (!gt_ok) return null;
 
-        // Count samples
-        var n_samples: usize = 1;
-        for (line[samples_start..]) |c| {
-            if (c == '\t') n_samples += 1;
-        }
+        // Count samples using SIMD tab counting
+        const n_samples: usize = 1 + simd.countByte(line[samples_start..], '\t');
 
         var genotypes = try allocator.alloc(Genotype, n_samples);
 
-        // Parse each sample's GT field (first subfield before ':')
+        // Parse each sample's GT field using SIMD delimiter finding
+        const gt_delims = [_]u8{ ':', '\t', '\n' };
         var smpl_idx: usize = 0;
         var pos: usize = samples_start;
         while (smpl_idx < n_samples) : (smpl_idx += 1) {
-            // Find the end of the GT subfield (first ':' or '\t' or end of line)
-            var gt_end: usize = pos;
-            while (gt_end < line.len and line[gt_end] != ':' and line[gt_end] != '\t' and line[gt_end] != '\n') {
-                gt_end += 1;
-            }
+            // Find the end of the GT subfield (first ':' or '\t' or '\n')
+            const rest = line[pos..];
+            const gt_off = simd.findAnyByte(rest, &gt_delims) orelse rest.len;
+            const gt_end = pos + gt_off;
             genotypes[smpl_idx] = Genotype.parse(line[pos..gt_end]);
 
             // Advance to the next sample (skip to next '\t')
-            var next_pos = gt_end;
-            while (next_pos < line.len and line[next_pos] != '\t') {
-                next_pos += 1;
-            }
+            const after_gt = line[gt_end..];
+            const tab_off = simd.findByte(after_gt, '\t') orelse after_gt.len;
+            const next_pos = gt_end + tab_off;
             pos = if (next_pos < line.len) next_pos + 1 else next_pos;
         }
 
@@ -1058,9 +1065,19 @@ pub const CsqContext = struct {
 
         if (rbeg >= ref.len or vbeg >= vcf_ref.len) return;
 
-        // Compare character by character
+        // Determine comparison length
+        const ref_avail = ref.len - rbeg;
+        const vcf_avail = vcf_ref.len - vbeg;
+        const cmp_len = @min(ref_avail, vcf_avail);
+
+        // SIMD fast path: case-insensitive comparison of the whole range at once
+        if (simd.eqlIgnoreCase(ref[rbeg .. rbeg + cmp_len], vcf_ref[vbeg .. vbeg + cmp_len])) {
+            return; // match — nothing to do
+        }
+
+        // Mismatch detected — find the exact position for error reporting
         var i: usize = 0;
-        while (rbeg + i < ref.len and vbeg + i < vcf_ref.len) : (i += 1) {
+        while (i < cmp_len) : (i += 1) {
             const rc = std.ascii.toUpper(ref[rbeg + i]);
             const vc = std.ascii.toUpper(vcf_ref[vbeg + i]);
             if (rc != vc) {

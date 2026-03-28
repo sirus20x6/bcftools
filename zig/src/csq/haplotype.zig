@@ -13,6 +13,7 @@ const types = @import("types.zig");
 const gff_types = @import("../gff/types.zig");
 const translate = @import("translate.zig");
 const splice_mod = @import("splice.zig");
+const simd = @import("../core/simd.zig");
 
 const CsqType = types.CsqType;
 const HapNode = types.HapNode;
@@ -376,31 +377,8 @@ fn appendCodonRev(
 
 /// Find the first position where two byte slices differ.
 /// Returns null if they are identical over the compared range.
-pub fn simdFirstMismatch(a: []const u8, b: []const u8) ?usize {
-    const len = @min(a.len, b.len);
-    var i: usize = 0;
-
-    // SIMD: compare 16 bytes at a time
-    while (i + 16 <= len) {
-        const va: @Vector(16, u8) = a[i..][0..16].*;
-        const vb: @Vector(16, u8) = b[i..][0..16].*;
-        const neq: @Vector(16, bool) = va != vb;
-        // Check if any mismatch in this chunk
-        if (@reduce(.Or, neq)) {
-            // Find first mismatch position via bitmask
-            const mask: u16 = @bitCast(neq);
-            return i + @ctz(mask);
-        }
-        i += 16;
-    }
-
-    // Scalar fallback
-    while (i < len) {
-        if (a[i] != b[i]) return i;
-        i += 1;
-    }
-    return null;
-}
+/// Delegates to the shared SIMD utility module.
+pub const simdFirstMismatch = simd.firstMismatch;
 
 // ---------------------------------------------------------------------------
 // hapAddCsq — determine consequence type from translated ref vs alt protein

@@ -1,4 +1,5 @@
 const std = @import("std");
+const simd = @import("../core/simd.zig");
 const VcfRecord = @import("record.zig").VcfRecord;
 
 /// Simple text VCF reader (not bgzf/bcf — those need htslib).
@@ -93,7 +94,7 @@ pub const VcfReader = struct {
     /// Return the next line from the remaining content, advancing the cursor.
     fn nextLine(self: *VcfReader) ?[]const u8 {
         if (self.remaining.len == 0) return null;
-        if (std.mem.indexOfScalar(u8, self.remaining, '\n')) |idx| {
+        if (simd.findByte(self.remaining, '\n')) |idx| {
             const line = self.remaining[0..idx];
             self.remaining = self.remaining[idx + 1 ..];
             return line;

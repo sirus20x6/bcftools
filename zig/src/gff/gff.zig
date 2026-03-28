@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const region = @import("../core/region.zig");
+const simd = @import("../core/simd.zig");
 
 const RegionIndex = region.RegionIndex;
 const Biotype = types.Biotype;
@@ -221,8 +222,8 @@ pub const GffParser = struct {
 
         var remaining = content;
         while (remaining.len > 0) {
-            // Find end of line
-            const nl_pos = std.mem.indexOfScalar(u8, remaining, '\n');
+            // Find end of line (SIMD-accelerated)
+            const nl_pos = simd.findByte(remaining, '\n');
             const line = if (nl_pos) |pos| remaining[0..pos] else remaining;
             remaining = if (nl_pos) |pos| remaining[pos + 1 ..] else remaining[remaining.len..];
 
@@ -295,7 +296,7 @@ pub const GffParser = struct {
                 col_count += 1;
                 break;
             }
-            if (std.mem.indexOfScalar(u8, rest, '\t')) |tab_pos| {
+            if (simd.findByte(rest, '\t')) |tab_pos| {
                 cols[col_count] = rest[0..tab_pos];
                 rest = rest[tab_pos + 1 ..];
             } else {
@@ -392,8 +393,8 @@ pub const GffParser = struct {
         var remaining = attrs_str;
 
         while (remaining.len > 0) {
-            // Find the end of this key=value pair
-            const semi_pos = std.mem.indexOfScalar(u8, remaining, ';') orelse remaining.len;
+            // Find the end of this key=value pair (SIMD-accelerated)
+            const semi_pos = simd.findByte(remaining, ';') orelse remaining.len;
             const pair = remaining[0..semi_pos];
             remaining = if (semi_pos < remaining.len) remaining[semi_pos + 1 ..] else &[_]u8{};
 

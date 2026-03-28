@@ -7,6 +7,7 @@
 // Architecture: tokenize -> shunting-yard RPN conversion -> per-record evaluation.
 
 const std = @import("std");
+const simd = @import("../core/simd.zig");
 const VcfRecord = @import("../vcf/record.zig").VcfRecord;
 
 /// Token types used in the filter expression.
@@ -350,55 +351,60 @@ fn hasInfoFlag(rec: *const VcfRecord, field: []const u8) bool {
 }
 
 /// Get the INFO column (field 7) from the record's stored line.
+/// Uses SIMD-accelerated tab finding to skip to field 7 quickly.
 fn getInfoColumn(rec: *const VcfRecord) ?[]const u8 {
     const storage = rec._storage orelse return null;
     var col: usize = 0;
     var start: usize = 0;
-    for (storage, 0..) |c, i| {
-        if (c == '\t') {
-            if (col == 7) {
-                return storage[start..i];
+    var remaining = storage;
+
+    // Skip to field 7 using SIMD tab finding
+    while (col < 7) {
+        if (simd.findByte(remaining, '\t')) |tab_pos| {
+            if (col == 6) {
+                start = (@intFromPtr(remaining.ptr) - @intFromPtr(storage.ptr)) + tab_pos + 1;
             }
+            remaining = remaining[tab_pos + 1 ..];
             col += 1;
-            start = i + 1;
+        } else {
+            return null; // not enough columns
         }
     }
-    // Last column
-    if (col == 7) {
-        return storage[start..];
+    // Now remaining starts at field 7; find the end (next tab or end of string)
+    if (simd.findByte(remaining, '\t')) |tab_pos| {
+        return remaining[0..tab_pos];
     }
-    return null;
+    return remaining;
 }
 
 /// Find a numeric value for `tag` in an INFO string like "DP=50;AF=0.1;MQ=30".
+/// Uses SIMD-accelerated delimiter scanning.
 fn findInfoNumeric(info: []const u8, tag: []const u8) ?f64 {
+    const delims = [_]u8{ '=', ';' };
     var pos: usize = 0;
     while (pos < info.len) {
-        // Find the start of the next key
         const key_start = pos;
-        var key_end = key_start;
-        while (key_end < info.len and info[key_end] != '=' and info[key_end] != ';') {
-            key_end += 1;
-        }
+        const rest = info[key_start..];
+        const delim_offset = simd.findAnyByte(rest, &delims) orelse rest.len;
+        const key_end = key_start + delim_offset;
         const key = info[key_start..key_end];
 
         if (std.mem.eql(u8, key, tag)) {
             if (key_end < info.len and info[key_end] == '=') {
                 const val_start = key_end + 1;
-                var val_end = val_start;
-                while (val_end < info.len and info[val_end] != ';') {
-                    val_end += 1;
-                }
-                return std.fmt.parseFloat(f64, info[val_start..val_end]) catch null;
+                const val_rest = info[val_start..];
+                const semi_offset = simd.findByte(val_rest, ';') orelse val_rest.len;
+                return std.fmt.parseFloat(f64, info[val_start .. val_start + semi_offset]) catch null;
             }
-            return null; // Flag field, no numeric value
+            return null;
         }
 
         // Skip to next field
         var next = key_end;
         if (next < info.len and info[next] == '=') {
-            next += 1;
-            while (next < info.len and info[next] != ';') next += 1;
+            const val_rest = info[next + 1 ..];
+            const semi_offset = simd.findByte(val_rest, ';') orelse val_rest.len;
+            next = next + 1 + semi_offset;
         }
         if (next < info.len and info[next] == ';') next += 1;
         pos = next;
@@ -407,32 +413,32 @@ fn findInfoNumeric(info: []const u8, tag: []const u8) ?f64 {
 }
 
 /// Find a string value for `tag` in INFO.
+/// Uses SIMD-accelerated delimiter scanning.
 fn findInfoString(info: []const u8, tag: []const u8) ?[]const u8 {
+    const delims = [_]u8{ '=', ';' };
     var pos: usize = 0;
     while (pos < info.len) {
         const key_start = pos;
-        var key_end = key_start;
-        while (key_end < info.len and info[key_end] != '=' and info[key_end] != ';') {
-            key_end += 1;
-        }
+        const rest = info[key_start..];
+        const delim_offset = simd.findAnyByte(rest, &delims) orelse rest.len;
+        const key_end = key_start + delim_offset;
         const key = info[key_start..key_end];
 
         if (std.mem.eql(u8, key, tag)) {
             if (key_end < info.len and info[key_end] == '=') {
                 const val_start = key_end + 1;
-                var val_end = val_start;
-                while (val_end < info.len and info[val_end] != ';') {
-                    val_end += 1;
-                }
-                return info[val_start..val_end];
+                const val_rest = info[val_start..];
+                const semi_offset = simd.findByte(val_rest, ';') orelse val_rest.len;
+                return info[val_start .. val_start + semi_offset];
             }
             return null;
         }
 
         var next = key_end;
         if (next < info.len and info[next] == '=') {
-            next += 1;
-            while (next < info.len and info[next] != ';') next += 1;
+            const val_rest = info[next + 1 ..];
+            const semi_offset = simd.findByte(val_rest, ';') orelse val_rest.len;
+            next = next + 1 + semi_offset;
         }
         if (next < info.len and info[next] == ';') next += 1;
         pos = next;
@@ -441,22 +447,24 @@ fn findInfoString(info: []const u8, tag: []const u8) ?[]const u8 {
 }
 
 /// Check if `tag` is present as a flag in INFO.
+/// Uses SIMD-accelerated delimiter scanning.
 fn findInfoFlag(info: []const u8, tag: []const u8) bool {
+    const delims = [_]u8{ '=', ';' };
     var pos: usize = 0;
     while (pos < info.len) {
         const key_start = pos;
-        var key_end = key_start;
-        while (key_end < info.len and info[key_end] != '=' and info[key_end] != ';') {
-            key_end += 1;
-        }
+        const rest = info[key_start..];
+        const delim_offset = simd.findAnyByte(rest, &delims) orelse rest.len;
+        const key_end = key_start + delim_offset;
         const key = info[key_start..key_end];
 
         if (std.mem.eql(u8, key, tag)) return true;
 
         var next = key_end;
         if (next < info.len and info[next] == '=') {
-            next += 1;
-            while (next < info.len and info[next] != ';') next += 1;
+            const val_rest = info[next + 1 ..];
+            const semi_offset = simd.findByte(val_rest, ';') orelse val_rest.len;
+            next = next + 1 + semi_offset;
         }
         if (next < info.len and info[next] == ';') next += 1;
         pos = next;

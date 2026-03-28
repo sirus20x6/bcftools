@@ -1,4 +1,5 @@
 const std = @import("std");
+const simd = @import("../core/simd.zig");
 
 /// A high-performance pure-Zig VCF reader that does not depend on htslib.
 ///
@@ -263,7 +264,7 @@ pub const NativeReader = struct {
         while (true) {
             // Search for newline in buffered data
             const search_region = self.buffer[line_start..self.buf_len];
-            if (std.mem.indexOfScalar(u8, search_region, '\n')) |rel_idx| {
+            if (simd.findByte(search_region, '\n')) |rel_idx| {
                 const newline_pos = line_start + rel_idx;
                 var end = newline_pos;
                 // Strip \r before \n
