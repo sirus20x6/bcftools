@@ -5,6 +5,7 @@ const gff_mod = lib.gff;
 const htslib = lib.vcf_htslib;
 const VcfReader = lib.vcf_reader.VcfReader;
 const VcfRecord = lib.vcf_record.VcfRecord;
+const NativeReader = lib.vcf_native.NativeReader;
 const CsqContext = csq_mod.CsqContext;
 const GffParser = gff_mod.GffParser;
 const Phase = csq_mod.Phase;
@@ -504,6 +505,7 @@ fn writeFlushedRecords(
         // Free the duped bcsq_value string and fmt_bm
         if (fr.bcsq_value) |bv| allocator.free(bv);
         if (fr.fmt_bm) |bm| allocator.free(bm);
+        if (fr.raw_line) |rl| allocator.free(rl);
 
         // Remove from map to free memory
         _ = line_map.remove(key);
@@ -528,6 +530,7 @@ fn writeFlushedRecordsHts(
 
         if (fr.bcsq_value) |bv| allocator.free(bv);
         if (fr.fmt_bm) |bm| allocator.free(bm);
+        if (fr.raw_line) |rl| allocator.free(rl);
 
         _ = line_map.remove(key);
     }
@@ -588,6 +591,28 @@ fn writeFlushedRecordsDirect(
 
         if (fr.bcsq_value) |bv| allocator.free(bv);
         if (fr.fmt_bm) |bm| allocator.free(bm);
+        if (fr.raw_line) |rl| allocator.free(rl);
+    }
+    csq_ctx.flushed_records.clearRetainingCapacity();
+}
+
+/// Drain flushed records from the CSQ context and write them as text VCF lines.
+/// Used for the native reader path (no htslib involvement in output).
+fn writeFlushedRecordsNative(
+    allocator: std.mem.Allocator,
+    out: std.fs.File,
+    csq_ctx: *CsqContext,
+    bcsq_tag: []const u8,
+    n_samples: u32,
+) !void {
+    for (csq_ctx.flushed_records.items) |fr| {
+        const original_line = fr.raw_line orelse continue;
+
+        try writeVcfLine(allocator, out, original_line, fr.bcsq_value, bcsq_tag, fr.fmt_bm, fr.nfmt, n_samples);
+
+        if (fr.bcsq_value) |bv| allocator.free(bv);
+        if (fr.fmt_bm) |bm| allocator.free(bm);
+        allocator.free(original_line);
     }
     csq_ctx.flushed_records.clearRetainingCapacity();
 }
@@ -634,10 +659,27 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
 
     const allocator = std.heap.c_allocator;
 
-    // ---- Open VCF input via htslib synced reader (efficient BCF/VCF.gz support) ----
+    // ---- Detect whether to use the native Zig VCF reader ----
+    // Use native reader for uncompressed VCF input with text VCF output (-O v).
+    // This eliminates all htslib FFI calls from the hot loop.
+    // For BCF (.bcf), compressed VCF (.vcf.gz), or non-text output (-O b/z/u),
+    // fall back to the htslib path.
+    const input_fname = opts.input_fname.?;
+    const use_native = blk: {
+        if (opts.output_type != 'v') break :blk false;
+        if (std.mem.endsWith(u8, input_fname, ".vcf")) break :blk true;
+        break :blk false;
+    };
+
+    if (use_native) {
+        return runCsqNative(allocator, &opts);
+    }
+
+    // ---- htslib path: BCF, compressed VCF, or non-text output ----
+
     var input_fname_buf: [4096]u8 = undefined;
     const input_fname_z: [*:0]const u8 = blk: {
-        const fname = opts.input_fname.?;
+        const fname = input_fname;
         if (fname.len >= input_fname_buf.len) {
             stderr_file.writeAll("Error: input path too long\n") catch {};
             std.process.exit(1);
@@ -648,7 +690,7 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
     };
 
     var hts_reader = htslib.HtsVcfReader.open(input_fname_z) catch {
-        std.debug.print("Error: failed to open VCF file '{s}'\n", .{opts.input_fname.?});
+        std.debug.print("Error: failed to open VCF file '{s}'\n", .{input_fname});
         std.process.exit(1);
     };
     defer hts_reader.close();
@@ -657,9 +699,6 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
     const in_hdr = hts_reader.hdr.raw;
 
     // ---- Determine output mode ----
-    // Always use htslib writer: for -O v (text VCF) we use "w" mode,
-    // for -O b/z/u we use the appropriate binary mode.
-    // This avoids text serialization roundtrip for all output types.
     const hts_mode: [*:0]const u8 = switch (opts.output_type) {
         'b' => "wb",  // BCF compressed
         'u' => "wbu", // BCF uncompressed
@@ -830,6 +869,181 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
         std.debug.print("Warning: error flushing CSQ buffer: {}\n", .{err});
     };
     writeFlushedRecordsDirect(allocator, &hts_writer, out_hdr, &csq_ctx, bcsq_tag_z, n_samples) catch |err| {
+        std.debug.print("Error: failed to write final flushed records: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    if (n_errors > 0) {
+        std.debug.print("Processed {d} records with {d} warnings/errors\n", .{ n_records, n_errors });
+    }
+}
+
+// -------------------------------------------------------------------------
+// Native Zig VCF reader path — zero FFI in the hot loop
+// -------------------------------------------------------------------------
+
+/// Build a pipeline VcfRecord from the native reader's zero-copy fields.
+/// The returned record borrows slices from the reader's buffer; the caller
+/// must deep-copy fields that need to outlive the next reader.next() call.
+fn buildCsqRecordFromNative(reader: *NativeReader) csq_mod.VcfRecord {
+    const ref = reader.refAllele();
+    var n_alleles: u32 = 1;
+    allele_scratch[0] = ref;
+
+    var alt_iter = reader.altAlleles();
+    while (alt_iter.next()) |alt| {
+        if (n_alleles >= allele_scratch.len) break;
+        allele_scratch[n_alleles] = alt;
+        n_alleles += 1;
+    }
+
+    const chr = reader.chrom();
+    const rid: i32 = reader.header.contig_map.get(chr) orelse 0;
+
+    return .{
+        .pos = reader.pos(),
+        .rid = rid,
+        .n_allele = n_alleles,
+        .alleles = allele_scratch[0..n_alleles],
+        .rlen = @intCast(ref.len),
+        .chr = chr,
+        .raw_line = reader.current_line,
+    };
+}
+
+/// Native reader CSQ pipeline: reads uncompressed VCF via the pure-Zig
+/// SIMD reader, processes through CsqContext, and writes text VCF output
+/// directly. No htslib calls in the hot loop — only faidx for FASTA.
+fn runCsqNative(allocator: std.mem.Allocator, opts: *const CsqOptions) !void {
+    const input_fname = opts.input_fname.?;
+
+    // ---- Open native VCF reader ----
+    var reader = NativeReader.open(allocator, input_fname) catch {
+        std.debug.print("Error: failed to open VCF file '{s}'\n", .{input_fname});
+        std.process.exit(1);
+    };
+    defer reader.deinit();
+
+    // ---- Open output file ----
+    const out_file: std.fs.File = if (opts.output_fname) |fname|
+        std.fs.cwd().createFile(fname, .{}) catch {
+            std.debug.print("Error: failed to open output file '{s}'\n", .{fname});
+            std.process.exit(1);
+        }
+    else
+        stdout_file;
+    defer if (opts.output_fname != null) out_file.close();
+
+    // ---- Write header with BCSQ definitions injected ----
+    {
+        // Write all original header lines except the #CHROM line
+        for (reader.header.raw_lines.items) |line| {
+            if (line.len > 0 and line[0] == '#' and (line.len < 2 or line[1] == '#')) {
+                out_file.writeAll(line) catch {};
+                out_file.writeAll("\n") catch {};
+            }
+        }
+        // Inject BCSQ INFO header line
+        var bcsq_info_buf: [512]u8 = undefined;
+        const bcsq_info = std.fmt.bufPrint(&bcsq_info_buf, "##INFO=<ID={s},Number=.,Type=String,Description=\"Haplotype-aware consequence annotation from BCFtools/csq\">", .{opts.custom_tag}) catch {
+            stderr_file.writeAll("Error: BCSQ tag too long\n") catch {};
+            std.process.exit(1);
+        };
+        out_file.writeAll(bcsq_info) catch {};
+        out_file.writeAll("\n") catch {};
+
+        // Inject BCSQ FORMAT header line
+        var bcsq_fmt_buf: [512]u8 = undefined;
+        const bcsq_fmt = std.fmt.bufPrint(&bcsq_fmt_buf, "##FORMAT=<ID={s},Number=.,Type=Integer,Description=\"Bitmask of indexes to consequence types listed in the INFO/{s} tag\">", .{ opts.custom_tag, opts.custom_tag }) catch {
+            stderr_file.writeAll("Error: BCSQ tag too long\n") catch {};
+            std.process.exit(1);
+        };
+        out_file.writeAll(bcsq_fmt) catch {};
+        out_file.writeAll("\n") catch {};
+
+        // Write the #CHROM line (last header line)
+        for (reader.header.raw_lines.items) |line| {
+            if (line.len > 0 and line[0] == '#' and line.len >= 2 and line[1] != '#') {
+                out_file.writeAll(line) catch {};
+                out_file.writeAll("\n") catch {};
+            }
+        }
+    }
+
+    // ---- Count samples from native header ----
+    const n_samples: u32 = @intCast(reader.header.nSamples());
+
+    var phase = opts.phase;
+    if (n_samples == 0) phase = .drop_gt;
+
+    // ---- Open FASTA reference (only htslib call — used rarely per transcript) ----
+    const fasta_z = blk: {
+        var buf: [4096]u8 = undefined;
+        const fname = opts.fasta_fname.?;
+        if (fname.len >= buf.len) {
+            stderr_file.writeAll("Error: fasta path too long\n") catch {};
+            std.process.exit(1);
+        }
+        @memcpy(buf[0..fname.len], fname);
+        buf[fname.len] = 0;
+        break :blk buf[0..fname.len :0];
+    };
+    var fai = htslib.HtsFaidx.open(fasta_z) catch {
+        std.debug.print("Error: failed to open FASTA reference '{s}'\n", .{opts.fasta_fname.?});
+        std.process.exit(1);
+    };
+    defer fai.close();
+
+    // ---- Initialize CSQ context ----
+    var csq_ctx = CsqContext.init(allocator, .{
+        .gff_fname = opts.gff_fname.?,
+        .fasta_fname = opts.fasta_fname.?,
+        .phase = phase,
+        .local_csq = opts.local_csq,
+        .verbosity = 1,
+        .force = opts.force,
+        .bcsq_tag = opts.custom_tag,
+        .ncsq2_max = opts.ncsq * 2,
+        .brief_predictions = opts.brief_predictions,
+        .n_threads = opts.n_threads,
+        .n_samples = n_samples,
+        .fai_ptr = @ptrCast(&fai),
+        .fetch_seq_fn = &htsFaidxFetchAdapter,
+    }) catch |err| {
+        std.debug.print("Error: failed to initialize CSQ context: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer csq_ctx.deinit();
+
+    // ---- Main processing loop — zero FFI ----
+    var n_records: u64 = 0;
+    var n_errors: u64 = 0;
+
+    while (true) {
+        const has_record = reader.next() catch false;
+        if (!has_record) break;
+        n_records += 1;
+
+        const csq_rec = buildCsqRecordFromNative(&reader);
+        csq_ctx.process(&csq_rec) catch |err| {
+            n_errors += 1;
+            if (n_errors <= 10) {
+                std.debug.print("Warning: CSQ processing error at {s}:{d}: {}\n", .{ csq_rec.chr, csq_rec.pos + 1, err });
+            }
+        };
+
+        // Write flushed records as text (no htslib)
+        writeFlushedRecordsNative(allocator, out_file, &csq_ctx, opts.custom_tag, n_samples) catch |err| {
+            std.debug.print("Error: failed to write flushed records: {}\n", .{err});
+            std.process.exit(1);
+        };
+    }
+
+    // ---- Flush remaining buffered records ----
+    csq_ctx.flush() catch |err| {
+        std.debug.print("Warning: error flushing CSQ buffer: {}\n", .{err});
+    };
+    writeFlushedRecordsNative(allocator, out_file, &csq_ctx, opts.custom_tag, n_samples) catch |err| {
         std.debug.print("Error: failed to write final flushed records: {}\n", .{err});
         std.process.exit(1);
     };

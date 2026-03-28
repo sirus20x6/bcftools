@@ -1304,6 +1304,9 @@ pub const CsqContext = struct {
         /// When false, the bcf1_t is borrowed from htslib's reader and must NOT
         /// be destroyed — the reader will reuse the memory.
         bcf_owned: bool = true,
+        /// Raw VCF text line for native (non-htslib) output path.
+        /// When non-null, text output can inject BCSQ into this line directly.
+        raw_line: ?[]const u8 = null,
     };
 
     /// Comparison function for sorting consequences in BCSQ output.
@@ -1353,11 +1356,15 @@ pub const CsqContext = struct {
                     const is_owned = vrec.bcf_owned;
                     @constCast(rec_ptr).raw_bcf = null;
                     vrec.bcf_owned = true; // prevent double-free in deinit
+                    // Transfer raw_line for native text output path
+                    const raw_line_ptr = rec_ptr.raw_line;
+                    @constCast(rec_ptr).raw_line = null;
                     try self.flushed_records.append(self.allocator, .{
                         .pos = rec_ptr.pos,
                         .rid = rec_ptr.rid,
                         .raw_bcf = raw_bcf_ptr,
                         .bcf_owned = is_owned,
+                        .raw_line = raw_line_ptr,
                     });
                     continue;
                 }
@@ -1393,6 +1400,9 @@ pub const CsqContext = struct {
                 const raw_bcf_ptr = rec_ptr.raw_bcf;
                 @constCast(rec_ptr).raw_bcf = null;
                 vrec.bcf_owned = true; // prevent double-free in deinit
+                // Transfer raw_line for native text output path
+                const raw_line_ptr2 = rec_ptr.raw_line;
+                @constCast(rec_ptr).raw_line = null;
                 try self.flushed_records.append(self.allocator, .{
                     .pos = rec_ptr.pos,
                     .rid = rec_ptr.rid,
@@ -1401,6 +1411,7 @@ pub const CsqContext = struct {
                     .nfmt = vrec.nfmt,
                     .raw_bcf = raw_bcf_ptr,
                     .bcf_owned = true, // ensureBcfOwned guarantees this
+                    .raw_line = raw_line_ptr2,
                 });
                 // Transfer ownership of fmt_bm to the flushed record
                 // so that vrec.deinit() won't free it.
