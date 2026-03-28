@@ -630,7 +630,7 @@ fn runCsq(args_iter: *std.process.ArgIterator) !void {
         std.process.exit(1);
     }
 
-    const allocator = std.heap.page_allocator;
+    const allocator = std.heap.c_allocator;
 
     // ---- Open VCF input via htslib synced reader (efficient BCF/VCF.gz support) ----
     var input_fname_buf: [4096]u8 = undefined;
@@ -905,7 +905,7 @@ fn runStats(args_iter: *std.process.ArgIterator) !void {
         std.process.exit(1);
     }
 
-    const allocator = std.heap.page_allocator;
+    const allocator = std.heap.c_allocator;
 
     // Open VCF input
     var reader = VcfReader.open(allocator, opts.input_fname.?) catch |err| {
@@ -974,7 +974,7 @@ fn runStats(args_iter: *std.process.ArgIterator) !void {
 // -------------------------------------------------------------------------
 
 pub fn main() !void {
-    const allocator = std.heap.page_allocator;
+    const allocator = std.heap.c_allocator;
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
 
@@ -1026,7 +1026,7 @@ pub fn main() !void {
 // -------------------------------------------------------------------------
 
 fn runNorm(args: *std.process.ArgIterator) !void {
-    const allocator = std.heap.page_allocator;
+    const allocator = std.heap.c_allocator;
     const stderr_f = std.fs.File{ .handle = std.posix.STDERR_FILENO };
     const stdout_f = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
 
@@ -1136,7 +1136,7 @@ const merge_usage_text =
 ;
 
 fn runMerge(args_iter: *std.process.ArgIterator) !void {
-    const allocator = std.heap.page_allocator;
+    const allocator = std.heap.c_allocator;
     const stderr_f = std.fs.File{ .handle = std.posix.STDERR_FILENO };
     const stdout_f = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
 
