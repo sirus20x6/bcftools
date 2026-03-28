@@ -41,6 +41,14 @@ pub fn RegionIndex(comptime Payload: type) type {
         allocator: std.mem.Allocator,
         next_insert_order: u32 = 0,
 
+        // Gap cache: when a query returns no overlaps, we cache the gap
+        // boundaries so that subsequent queries within the same gap can
+        // skip the binary searches entirely.  Genomic data is sorted, so
+        // consecutive intergenic variants benefit heavily from this.
+        gap_cache_seq: ?[*]const u8 = null, // pointer identity of cached sequence key
+        gap_cache_lo: u32 = 0, // lower bound of gap (exclusive: max_end of last interval before gap)
+        gap_cache_hi: u32 = 0, // upper bound of gap (exclusive: beg of first interval after gap)
+
         pub fn init(alloc: std.mem.Allocator) Self {
             return .{
                 .sequences = std.StringHashMap(std.ArrayList(Interval)).init(alloc),
@@ -87,18 +95,52 @@ pub fn RegionIndex(comptime Payload: type) type {
             self.sorted = true;
         }
 
+        /// Empty iterator singleton (returned for gap cache hits).
+        const empty_intervals: []const Interval = &[_]Interval{};
+
         pub fn overlap(self: *Self, seq: []const u8, beg: u32, end: u32) OverlapIterator {
             if (!self.sorted) self.sort();
-            const intervals = if (self.sequences.get(seq)) |list| list.items else &[_]Interval{};
+
+            // Look up the interval list for this sequence.
+            // We use getKeyPtr to get the stable HashMap key pointer for gap caching.
+            const entry = self.sequences.getEntry(seq);
+            const intervals = if (entry) |e| e.value_ptr.items else &[_]Interval{};
+            const stable_key_ptr: ?[*]const u8 = if (entry) |e| e.key_ptr.*.ptr else null;
+
+            // Gap cache fast path: if query falls entirely within a cached
+            // gap on the same sequence, return empty immediately (no binary searches).
+            if (self.gap_cache_seq) |cached_ptr| {
+                if (stable_key_ptr == cached_ptr and beg > self.gap_cache_lo and end < self.gap_cache_hi) {
+                    return .{
+                        .intervals = empty_intervals,
+                        .idx = 0,
+                        .query_beg = beg,
+                        .query_end = end,
+                    };
+                }
+            }
+
             // Binary search: find the first interval where beg > query_end.
-            // All intervals at or beyond that index have beg > end and cannot
-            // overlap, so we trim the slice.  The iterator still checks
-            // end >= query_beg for each entry (since end values are not monotonic).
             const hi = upperBound(intervals, end);
             // Binary search: find first index where max_end >= query_beg.
-            // All intervals before that index have max_end < query_beg,
-            // meaning none of them can overlap the query.
             const lo = lowerBoundMaxEnd(intervals[0..hi], beg);
+
+            // Update gap cache when the result is empty (no overlaps found).
+            if (lo >= hi) {
+                if (stable_key_ptr) |skp| {
+                    self.gap_cache_seq = skp;
+                    self.gap_cache_lo = if (lo > 0) intervals[lo - 1].max_end else 0;
+                    self.gap_cache_hi = if (hi < intervals.len) intervals[hi].beg else std.math.maxInt(u32);
+                }
+            } else {
+                // Overlaps found — invalidate cache for this sequence
+                if (self.gap_cache_seq) |cached_ptr| {
+                    if (stable_key_ptr == cached_ptr) {
+                        self.gap_cache_seq = null;
+                    }
+                }
+            }
+
             return .{
                 .intervals = intervals[lo..hi],
                 .idx = 0,

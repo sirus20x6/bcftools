@@ -384,6 +384,13 @@ pub fn setHtsHeader(hdr: *hts_c.bcf_hdr_t) void {
 pub const Vrec = struct {
     /// The VCF record. Owned (or swapped) pointer.
     rec: ?*const VcfRecord = null,
+    /// Whether the rec's string fields (alleles, chr, raw_line) are owned
+    /// by this Vrec and should be freed on deinit.  When false (shallow copy),
+    /// only the VcfRecord struct itself and raw_bcf are freed.
+    rec_strings_owned: bool = true,
+    /// Whether raw_bcf was dup'd (owned) or is borrowed from htslib reader.
+    /// When false, the raw_bcf pointer must be dup'd before the next VCF read.
+    bcf_owned: bool = true,
     /// Bitmask of sample consequences (first/second haplotype interleaved).
     fmt_bm: ?[]u32 = null,
     /// Number of fmt integers per sample actually used.
@@ -403,28 +410,46 @@ pub const Vrec = struct {
         }
         // Free the owned VcfRecord (heap-allocated by vbufPush)
         if (self.rec) |rec_ptr| {
-            // Free deep-copied slices
-            for (rec_ptr.alleles) |a| {
-                allocator.free(a);
+            if (self.rec_strings_owned) {
+                // Free deep-copied slices
+                for (rec_ptr.alleles) |a| {
+                    allocator.free(a);
+                }
+                if (rec_ptr.alleles.len > 0) {
+                    allocator.free(rec_ptr.alleles);
+                }
+                if (rec_ptr.chr.len > 0) {
+                    allocator.free(rec_ptr.chr);
+                }
+                if (rec_ptr.raw_line) |rl| {
+                    allocator.free(rl);
+                }
             }
-            if (rec_ptr.alleles.len > 0) {
-                allocator.free(rec_ptr.alleles);
-            }
-            if (rec_ptr.chr.len > 0) {
-                allocator.free(rec_ptr.chr);
-            }
-            if (rec_ptr.raw_line) |rl| {
-                allocator.free(rl);
-            }
-            if (rec_ptr.raw_bcf) |raw_ptr| {
-                const bcf_ptr: *hts_c.bcf1_t = @ptrCast(@alignCast(raw_ptr));
-                hts_c.bcf_compat_destroy(bcf_ptr);
+            if (self.bcf_owned) {
+                if (rec_ptr.raw_bcf) |raw_ptr| {
+                    const bcf_ptr: *hts_c.bcf1_t = @ptrCast(@alignCast(raw_ptr));
+                    hts_c.bcf_compat_destroy(bcf_ptr);
+                }
             }
             // rec is *const VcfRecord, need to cast to free
             const mutable: *VcfRecord = @constCast(rec_ptr);
             allocator.destroy(mutable);
             self.rec = null;
         }
+    }
+
+    /// Ensure the raw_bcf is owned (dup'd) so it survives past the current read.
+    /// Call this when the record needs to be kept beyond the current process() call.
+    pub fn ensureBcfOwned(self: *Vrec) void {
+        if (self.bcf_owned) return;
+        if (self.rec) |rec_ptr| {
+            if (rec_ptr.raw_bcf) |raw_ptr| {
+                const bcf_ptr: *hts_c.bcf1_t = @ptrCast(@alignCast(raw_ptr));
+                const duped = hts_c.bcf_compat_dup(bcf_ptr);
+                @constCast(rec_ptr).raw_bcf = @ptrCast(duped);
+            }
+        }
+        self.bcf_owned = true;
     }
 };
 
@@ -622,8 +647,10 @@ pub const CsqContext = struct {
     hdr_ptr: ?*anyopaque,
 
     // VCF record buffering
-    pos2vbuf: std.AutoHashMap(u32, usize), // pos -> ring buffer index (for existence check)
     vcf_rbuf: RingBuffer(*Vbuf),
+    // Free-lists for pooled allocation of Vbuf and VcfRecord structs.
+    // Avoids per-variant heap alloc/free overhead for the common case.
+    vbuf_pool: std.ArrayList(*Vbuf) = .empty,
 
     // Transcript management -- min-heap of active transcripts sorted by end position
     active_transcripts: ActiveTranscriptQueue,
@@ -733,7 +760,6 @@ pub const CsqContext = struct {
             .fai_ptr = options.fai_ptr,
             .fetch_seq_fn = options.fetch_seq_fn,
             .hdr_ptr = options.hdr_ptr,
-            .pos2vbuf = std.AutoHashMap(u32, usize).init(allocator),
             .vcf_rbuf = try RingBuffer(*Vbuf).init(allocator, 64),
             .active_transcripts = ActiveTranscriptQueue.init(allocator, {}),
             .rm_transcripts = .empty,
@@ -769,7 +795,12 @@ pub const CsqContext = struct {
             self.allocator.destroy(vbuf);
         }
         self.vcf_rbuf.deinit();
-        self.pos2vbuf.deinit();
+        // Free pooled objects
+        for (self.vbuf_pool.items) |vb| {
+            vb.vrecs.deinit(self.allocator);
+            self.allocator.destroy(vb);
+        }
+        self.vbuf_pool.deinit(self.allocator);
         self.csq_buf.deinit(self.allocator);
         self.output.deinit(self.allocator);
         // Free any duped bcsq_value strings and fmt_bm in flushed records
@@ -804,6 +835,28 @@ pub const CsqContext = struct {
         }
     }
 
+
+    // -----------------------------------------------------------------
+    // Pooled allocation helpers
+    // -----------------------------------------------------------------
+
+    fn poolAllocVbuf(self: *CsqContext) !*Vbuf {
+        if (self.vbuf_pool.items.len > 0) {
+            const last = self.vbuf_pool.items.len - 1;
+            const vb = self.vbuf_pool.items[last];
+            self.vbuf_pool.items.len = last;
+            return vb;
+        }
+        const vb = try self.allocator.create(Vbuf);
+        vb.* = .{};
+        return vb;
+    }
+
+    fn poolFreeVbuf(self: *CsqContext, vbuf: *Vbuf) void {
+        self.vbuf_pool.append(self.allocator, vbuf) catch {
+            self.allocator.destroy(vbuf);
+        };
+    }
 
     // -----------------------------------------------------------------
     // FASTA reference — fetch, init, splice, sanity check
@@ -1109,6 +1162,30 @@ pub const CsqContext = struct {
     }
 
     // -----------------------------------------------------------------
+    // findVbufByPos — scan ring buffer for a vbuf at a given position
+    // -----------------------------------------------------------------
+
+    /// Find a vbuf at the given position by scanning the ring buffer from
+    /// the tail (most recent entries first). The ring buffer is typically
+    /// very small (1-10 entries), so this is faster than a hash lookup.
+    fn findVbufByPos(self: *const CsqContext, target_pos: u32) ?*Vbuf {
+        // Fast path: check last entry (most common case — csqPush called
+        // right after vbufPush at the same position)
+        if (self.vcf_rbuf.len == 0) return null;
+        var k: usize = self.vcf_rbuf.len;
+        while (k > 0) {
+            k -= 1;
+            const candidate = self.vcf_rbuf.kth(k);
+            if (candidate.pos()) |p| {
+                if (p == target_pos) return candidate;
+                // Ring buffer is position-ordered; if we've gone past, stop early
+                if (p < target_pos) return null;
+            }
+        }
+        return null;
+    }
+
+    // -----------------------------------------------------------------
     // vbufPush — add a record to the position-indexed buffer
     // -----------------------------------------------------------------
 
@@ -1132,9 +1209,11 @@ pub const CsqContext = struct {
         if (same_pos) {
             vbuf = last_vbuf.?;
         } else {
-            // Allocate a new Vbuf for this position
-            vbuf = try self.allocator.create(Vbuf);
-            vbuf.* = .{};
+            // Allocate a new Vbuf for this position (from pool)
+            vbuf = try self.poolAllocVbuf();
+            // Reset for reuse: retain vrecs backing storage, clear length
+            vbuf.vrecs.clearRetainingCapacity();
+            vbuf.keep_until = 0;
             _ = try self.vcf_rbuf.append(vbuf);
         }
 
@@ -1143,36 +1222,40 @@ pub const CsqContext = struct {
         // remain valid until vbufFlush processes it.
         const owned_rec = try self.allocator.create(VcfRecord);
         owned_rec.* = rec.*;
-        // Deep-copy the alleles slice (points into caller's scratch buffer)
-        if (rec.alleles.len > 0) {
-            const alleles_copy = try self.allocator.alloc([]const u8, rec.alleles.len);
-            for (rec.alleles, 0..) |a, ai| {
-                alleles_copy[ai] = try self.allocator.dupe(u8, a);
+
+        // When raw_bcf is present (htslib path), do a shallow copy of all
+        // fields (alleles, chr, raw_line, raw_bcf). These are only accessed
+        // during the current process() call; after that, only raw_bcf/pos/rid
+        // are needed.  The bcf1_t will be dup'd on demand if the record needs
+        // to survive past the current process() call (i.e., CDS overlap
+        // extends keep_until).  For the majority of intergenic variants that
+        // flush immediately, this avoids bcf_dup entirely.
+        const shallow_copy = rec.raw_bcf != null;
+        if (shallow_copy) {
+            // Borrow raw_bcf without dup; string fields remain borrowed too
+        } else {
+            // Text-only path: deep-copy everything
+            if (rec.alleles.len > 0) {
+                const alleles_copy = try self.allocator.alloc([]const u8, rec.alleles.len);
+                for (rec.alleles, 0..) |a, ai| {
+                    alleles_copy[ai] = try self.allocator.dupe(u8, a);
+                }
+                owned_rec.alleles = alleles_copy;
             }
-            owned_rec.alleles = alleles_copy;
-        }
-        // Deep-copy chr slice
-        if (rec.chr.len > 0) {
-            owned_rec.chr = try self.allocator.dupe(u8, rec.chr);
-        }
-        // Deep-copy raw_line
-        if (rec.raw_line) |rl| {
-            owned_rec.raw_line = try self.allocator.dupe(u8, rl);
-        }
-        // Deep-copy bcf1_t via bcf_dup
-        if (rec.raw_bcf) |raw_ptr| {
-            const bcf_ptr: *hts_c.bcf1_t = @ptrCast(@alignCast(raw_ptr));
-            const duped = hts_c.bcf_compat_dup(bcf_ptr);
-            owned_rec.raw_bcf = @ptrCast(duped);
+            if (rec.chr.len > 0) {
+                owned_rec.chr = try self.allocator.dupe(u8, rec.chr);
+            }
+            if (rec.raw_line) |rl| {
+                owned_rec.raw_line = try self.allocator.dupe(u8, rl);
+            }
         }
 
         // Add the record as a new Vrec
         var vrec = Vrec{};
         vrec.rec = owned_rec;
+        vrec.rec_strings_owned = !shallow_copy;
+        vrec.bcf_owned = !shallow_copy;
         try vbuf.vrecs.append(self.allocator, vrec);
-
-        // Register in pos2vbuf for O(1) existence check by position
-        try self.pos2vbuf.put(rec.pos, 0);
 
         return .{ .vbuf = vbuf, .owned_rec = owned_rec };
     }
@@ -1200,6 +1283,10 @@ pub const CsqContext = struct {
         /// Raw bcf1_t pointer for in-place output (avoids text roundtrip).
         /// When non-null, the caller can inject BCSQ directly and write via htslib.
         raw_bcf: ?*anyopaque = null,
+        /// Whether raw_bcf is owned (dup'd) and should be destroyed after writing.
+        /// When false, the bcf1_t is borrowed from htslib's reader and must NOT
+        /// be destroyed — the reader will reuse the memory.
+        bcf_owned: bool = true,
     };
 
     /// Comparison function for sorting consequences in BCSQ output.
@@ -1238,27 +1325,29 @@ pub const CsqContext = struct {
 
             _ = self.vcf_rbuf.shift();
 
-            // Remove from pos2vbuf
-            if (vbuf.pos()) |vpos| {
-                _ = self.pos2vbuf.remove(vpos);
-            }
-
             // Format consequences for each record in the vbuf
             for (vbuf.vrecs.items) |*vrec| {
                 const rec_ptr = vrec.rec orelse continue;
 
                 if (vrec.vcsqs.items.len == 0) {
-                    // No consequences — record passes through unmodified
-                    // Transfer raw_bcf ownership to flushed record
+                    // No consequences — record passes through unmodified.
+                    // Transfer raw_bcf to flushed record (borrowed or owned).
                     const raw_bcf_ptr = rec_ptr.raw_bcf;
+                    const is_owned = vrec.bcf_owned;
                     @constCast(rec_ptr).raw_bcf = null;
+                    vrec.bcf_owned = true; // prevent double-free in deinit
                     try self.flushed_records.append(self.allocator, .{
                         .pos = rec_ptr.pos,
                         .rid = rec_ptr.rid,
                         .raw_bcf = raw_bcf_ptr,
+                        .bcf_owned = is_owned,
                     });
                     continue;
                 }
+
+                // Record has consequences — must have an owned bcf1_t
+                // because bcfUpdateInfoString will modify it in-place.
+                vrec.ensureBcfOwned();
 
                 // Sort consequences: non-compound (UTR, intron, splice-only)
                 // before compound (CDS-level). This matches C's output order
@@ -1286,6 +1375,7 @@ pub const CsqContext = struct {
                 // Transfer raw_bcf ownership to flushed record
                 const raw_bcf_ptr = rec_ptr.raw_bcf;
                 @constCast(rec_ptr).raw_bcf = null;
+                vrec.bcf_owned = true; // prevent double-free in deinit
                 try self.flushed_records.append(self.allocator, .{
                     .pos = rec_ptr.pos,
                     .rid = rec_ptr.rid,
@@ -1293,14 +1383,20 @@ pub const CsqContext = struct {
                     .fmt_bm = vrec.fmt_bm,
                     .nfmt = vrec.nfmt,
                     .raw_bcf = raw_bcf_ptr,
+                    .bcf_owned = true, // ensureBcfOwned guarantees this
                 });
                 // Transfer ownership of fmt_bm to the flushed record
                 // so that vrec.deinit() won't free it.
                 vrec.fmt_bm = null;
             }
 
-            vbuf.deinit(self.allocator);
-            self.allocator.destroy(vbuf);
+            // Deinit individual vrecs but keep the ArrayList backing storage
+            // for pool reuse.
+            for (vbuf.vrecs.items) |*vrec| {
+                vrec.deinit(self.allocator);
+            }
+            vbuf.vrecs.clearRetainingCapacity();
+            self.poolFreeVbuf(vbuf);
         }
 
         // When all active transcripts have been flushed, clean up the removal list
@@ -1511,17 +1607,7 @@ pub const CsqContext = struct {
         _ = tr;
 
         // Find the vbuf at this position
-        var vbuf: ?*Vbuf = null;
-        for (0..self.vcf_rbuf.len) |k| {
-            const candidate = self.vcf_rbuf.kth(k);
-            if (candidate.pos()) |p| {
-                if (p == rec_pos) {
-                    vbuf = candidate;
-                    break;
-                }
-            }
-        }
-        const vb = vbuf orelse return; // record may have already been flushed
+        const vb = self.findVbufByPos(rec_pos) orelse return; // record may have already been flushed
 
         // Find the vrec matching this allele.
         // For multi-allelic sites, match by vcf_ial; for biallelic, use the first vrec.
@@ -1737,6 +1823,9 @@ pub const CsqContext = struct {
                 try self.hapFlush(rec.pos - 1);
                 try self.vbufFlush(rec.pos - 1);
             }
+            // Materialize any borrowed bcf records remaining in the ring buffer
+            // (they must survive past the next hts_reader.next() call).
+            self.materializeBorrowedBcf();
             return;
         }
 
@@ -1786,7 +1875,26 @@ pub const CsqContext = struct {
             try self.vbufFlush(rec.pos - 1);
         }
 
+        // Materialize any borrowed bcf records remaining in the ring buffer
+        // (they must survive past the next hts_reader.next() call).
+        self.materializeBorrowedBcf();
+
         self.prev_pos = @intCast(rec.pos);
+    }
+
+    /// Ensure all borrowed bcf records in the ring buffer have their bcf1_t
+    /// dup'd so they survive past the next htslib read.  Called at the end
+    /// of process() after vbufFlush.  Only records that were NOT flushed
+    /// (i.e., kept in the ring buffer due to active transcripts) need this.
+    fn materializeBorrowedBcf(self: *CsqContext) void {
+        for (0..self.vcf_rbuf.len) |k| {
+            const vbuf = self.vcf_rbuf.kth(k);
+            for (vbuf.vrecs.items) |*vrec| {
+                if (!vrec.bcf_owned) {
+                    vrec.ensureBcfOwned();
+                }
+            }
+        }
     }
 
     /// Flush all remaining records. Call at end of input.
@@ -2823,23 +2931,9 @@ pub const CsqContext = struct {
     /// Uses field-level matching for dedup (audit fix #30): checks
     /// transcript, biotype, gene, allele, and vstr to decide merging.
     pub fn csqPush(self: *CsqContext, csq: *Csq, rec: *const VcfRecord) !bool {
-        // Look up the vbuf for this position
-        _ = self.pos2vbuf.get(csq.pos) orelse {
-            return error.VbufNotFound;
-        };
-
-        // Find the vbuf at this position by scanning the ring buffer
-        var vbuf: ?*Vbuf = null;
-        for (0..self.vcf_rbuf.len) |k| {
-            const candidate = self.vcf_rbuf.kth(k);
-            if (candidate.pos()) |p| {
-                if (p == csq.pos) {
-                    vbuf = candidate;
-                    break;
-                }
-            }
-        }
-        const vb = vbuf orelse return error.VbufNotFound;
+        // Find the vbuf at this position by scanning the ring buffer from tail
+        // (most recent position is most likely to match).
+        const vb = self.findVbufByPos(csq.pos) orelse return error.VbufNotFound;
 
         // Find the vrec matching this record.
         // Match by position + allele count since the stored record is a

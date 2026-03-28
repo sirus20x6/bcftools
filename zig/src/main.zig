@@ -580,8 +580,10 @@ fn writeFlushedRecordsDirect(
 
             try writer.writeRecord(bcf_rec);
 
-            // Destroy the dup'd bcf1_t
-            htslib.c.bcf_compat_destroy(bcf_rec);
+            // Destroy the dup'd bcf1_t (only if owned, not borrowed)
+            if (fr.bcf_owned) {
+                htslib.c.bcf_compat_destroy(bcf_rec);
+            }
         }
 
         if (fr.bcsq_value) |bv| allocator.free(bv);
